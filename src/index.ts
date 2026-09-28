@@ -42,6 +42,7 @@ const server = new McpServer(
       "Only call reveal_secret when the user explicitly needs to see a value.",
       "When the user wants to save or fetch a secret without exposing it to Claude, use sealed_save / sealed_fetch (macOS dialog / clipboard).",
       "MISSING CREDENTIALS: if a task needs a login/secret that is not in the vault (check list_items first, or a tool returns 'not found'), immediately call request_credential with a sensible suggested_ref and reason — it opens secure dialogs asking the user for the save path and the values — then continue the task with the returned ref.",
+      "LOGIN FAILURES: never try a credential from a different environment/service (e.g. the draft password on develop), and after ONE rejected login stop retrying - many systems lock accounts after a few attempts. Tell the user, and offer request_credential on the same path to re-enter it (saves a new version; old versions are kept).",
       "Never ask the user to paste secrets into chat.",
     ].join(" "),
   },

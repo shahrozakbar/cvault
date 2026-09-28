@@ -511,6 +511,7 @@ function contextFor(dir: string): string | null {
       "When a task needs one of these credentials, fetch it from cvault instead of asking the user or searching .env files:",
       "use run_with_secrets / write_env_file / http_request / materialize_file (values stay hidden), sealed_fetch / sealed_save when the user wants to get/set a value themselves.",
       "If a credential the task needs is NOT listed above, immediately call mcp__cvault__request_credential (suggested_ref e.g. \"admin-panel/superadmin\", reason e.g. \"log into the admin panel\", fields if more than username/password are needed): it pops up secure dialogs where the user chooses the save path and enters the values. Then continue with the returned ref.",
+      "Never use a credential from another environment/service to log in, and stop after ONE rejected login (accounts lock after a few attempts) - tell the user and offer request_credential on the same path to re-enter it.",
       "Never ask the user to paste a secret into chat.",
     ]
       .filter(Boolean)

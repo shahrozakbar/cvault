@@ -78,6 +78,18 @@ async function ask(opts: { title: string; message: string; defaultAnswer?: strin
   return r.stdout.slice(3);
 }
 
+const NOTICE_SCRIPT = `${ENV_TEXT_HANDLER}
+set theMsg to envText("CVAULT_MSG")
+set secs to (system attribute "CVAULT_SECS") as integer
+tell me to activate
+display dialog theMsg with title "cvault" buttons {"OK"} default button "OK" with icon caution giving up after secs
+`;
+
+/** Informational dialog (e.g. "entries did not match"). */
+async function notice(message: string, timeoutSec: number): Promise<void> {
+  await osascript(NOTICE_SCRIPT, { CVAULT_MSG: message, CVAULT_SECS: String(Math.min(timeoutSec, 60)) });
+}
+
 const isSecretField = (name: string) => /pass|secret|token|key|pin|otp|pwd/i.test(name);
 
 /**
@@ -281,14 +293,18 @@ export async function requestCredential(
 
     if (opts.type === "secret") {
       let value = "";
-      while (!value) {
+      for (;;) {
         value = await ask({
           title: `cvault - ${target}`,
           message: `Value for ${target}${prev ? `\n(exists as v${prev.version} - a new version will be saved)` : ""}`,
           hidden: true,
-          ok: "Save",
+          ok: "Next",
           timeoutSec: opts.timeoutSec,
         });
+        if (!value) continue;
+        const again = await ask({ title: `cvault - ${target}`, message: `Re-enter the value for ${target} to confirm`, hidden: true, ok: "Save", timeoutSec: opts.timeoutSec });
+        if (again === value) break;
+        await notice("The two entries did not match - please enter it again.", opts.timeoutSec);
       }
       const version = vault.setSecret(ref, value, opts.description, "mcp:request");
       return { ref, version, fields: [], created: !prev, adjustedFrom };
@@ -310,7 +326,19 @@ export async function requestCredential(
           ok: last ? "Save" : "Next",
           timeoutSec: opts.timeoutSec,
         });
-        if (value || current !== undefined || !hidden) break; // secret fields are required for new items
+        if (!value && (current !== undefined || !hidden)) break; // kept / optional
+        if (!value) continue; // secret fields are required for new items
+        if (!hidden) break;
+        // masked input: ask again so a typo can't be saved silently
+        const again = await ask({
+          title: `cvault - ${target} (${i + 1}/${names.length})`,
+          message: `Re-enter ${name} for ${target} to confirm`,
+          hidden: true,
+          ok: last ? "Save" : "Next",
+          timeoutSec: opts.timeoutSec,
+        });
+        if (again === value) break;
+        await notice(`The two ${name} entries did not match - please enter it again.`, opts.timeoutSec);
       }
       if (value) fields[name] = value;
     }

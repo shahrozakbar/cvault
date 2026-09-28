@@ -183,7 +183,9 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 ### Missing credentials
 When a task needs a login that isn't in the vault, the session hook, server instructions and "not found" errors all point Claude at `request_credential`. It opens native dialogs:
 1. **Path:** pre-filled with Claude's suggestion and editable. Paths with extra levels or messy characters are corrected automatically: `rezilens/develop/digrc-api-service/admin-panel/systemadmin` becomes `rezilens/digrc-api-service/develop-admin-panel/systemadmin`, with no second dialog. It only asks again when the intent can't be worked out.
-2. **Fields:** username (visible), password (hidden), plus any extra fields Claude asks for. For an existing item, leaving a field empty keeps its current value, and a new version is saved.
+2. **Fields:** username (visible), password (hidden), plus any extra fields Claude asks for. Masked fields (password, token, secret, key, pin, otp) are **asked twice**, and a mismatch asks again, so a typo can't be saved silently. For an existing item, leaving a field empty keeps its current value, and a new version is saved.
+
+If a login is rejected, Claude is told to stop after **one** attempt (accounts often lock after a few), never to try another environment's credential, and to offer `request_credential` on the same path to re-enter it.
 
 Claude only receives the resulting ref.
 
