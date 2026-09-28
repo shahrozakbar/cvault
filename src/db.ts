@@ -83,6 +83,9 @@ function migrate(db: Database.Database): void {
   for (const t of ["tenants", "projects", "services", "items"]) addColumn(db, t, "archived_at", "archived_at TEXT");
   addColumn(db, "items", "version", "version INTEGER NOT NULL DEFAULT 1");
   addColumn(db, "items", "source", "source TEXT");
+  // v3: enforced policies
+  addColumn(db, "services", "allowed_hosts", "allowed_hosts TEXT NOT NULL DEFAULT '[]'");
+  addColumn(db, "projects", "allow_chat_values", "allow_chat_values INTEGER NOT NULL DEFAULT 0");
   db.exec(`
     CREATE TABLE IF NOT EXISTS item_versions (
       id         INTEGER PRIMARY KEY,

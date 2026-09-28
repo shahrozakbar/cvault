@@ -64,6 +64,7 @@ interface ItemInfo {
   version: number;
   updated_at: string;
   archived_at?: string;
+  locked?: { at: string; reason: string };
 }
 
 // ---------- page / flash ----------
@@ -517,6 +518,7 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
       { name: "+ New credential…", value: "__cred" },
       { name: "+ New secret…", value: "__secret" },
       { name: "+ Upload file…", value: "__file" },
+      { name: `Allowed hosts… ${dim(`(${vault.allowedHosts(tenant, project, service).join(", ") || "any"})`)}`, value: "__hosts" },
       { name: yellow("Archive this service"), value: "__archive" },
       backChoice,
     ]);
@@ -524,6 +526,17 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
     if (a === "__cred") await act(() => newCredential(vault, tenant, project, service));
     else if (a === "__secret") await act(() => newSecret(vault, tenant, project, service));
     else if (a === "__file") await act(() => newFile(vault, tenant, project, service));
+    else if (a === "__hosts") {
+      await act(async () => {
+        const current = vault.allowedHosts(tenant, project, service).join(", ");
+        const answer = await input({
+          message: "Hosts this service's secrets may be sent to (comma-separated, *.example.com allowed; empty = any)",
+          default: current,
+        });
+        const hosts = vault.setAllowedHosts(tenant, project, service, answer.split(/[,\s]+/), SOURCE);
+        ok(`allowed hosts for ${service}: ${hosts.join(", ") || "any (no restriction)"}`);
+      });
+    }
     else if (a === "__archive") {
       if (await confirm({ message: `Archive service ${service}?`, default: false })) {
         await act(() => ok(vault.archive([tenant, project, service], SOURCE)));
@@ -662,6 +675,7 @@ function detailsTable(info: ItemInfo): string {
       ["role", info.role ? `${info.role}${info.default ? " (default)" : ""}` : info.default ? "(default)" : ""],
       ["version", `v${info.version} · updated ${info.updated_at} UTC`],
       ["description", info.description],
+      ...(info.locked ? [["LOCKED", `${info.locked.at} UTC - ${info.locked.reason}`] as Cell[]] : []),
     ],
     { maxCol: 0 },
   );
@@ -711,6 +725,7 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
       ...editOpts,
       section("Labels & lifecycle"),
       { name: "Role / default / description…", value: "tags" },
+      ...(info.locked ? [{ name: yellow("Unlock (allow Claude to use it again)"), value: "unlock" }] : []),
       { name: yellow("Archive this item"), value: "archive" },
       backChoice,
     ], last);
@@ -733,6 +748,10 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
         const src = await input({ message: "Path of the new file", validate: (v) => existsSync(resolve(v)) || "file not found" });
         ok(`saved as v${vault.putFile(ref, resolve(src), undefined, SOURCE).version}`);
       } else if (a === "tags") await editTags(vault, ref, info);
+      else if (a === "unlock") {
+        vault.unlockItem(ref, SOURCE);
+        ok(`unlocked ${info.ref}`);
+      }
       else if (a === "versions") await versionsMenu(vault, ref, info);
       else if (a === "archive") {
         if (await confirm({ message: `Archive ${info.ref}?`, default: false })) ok(vault.archive(info.ref.split("/"), SOURCE));

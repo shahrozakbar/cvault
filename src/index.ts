@@ -3,7 +3,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { httpRequest, materializeFile, runWithSecrets, writeEnvFile } from "./inject.js";
+import { checkHosts, lockRejected, prepareUse, remapPlaceholders } from "./enforce.js";
+import { httpRequest, materializeFile, PLACEHOLDER, runWithSecrets, writeEnvFile } from "./inject.js";
+import { extractHosts } from "./policy.js";
 import { passwordFromEnv } from "./password.js";
 import { requestCredential, sealedFetch, sealedSave } from "./sealed.js";
 import { formatRef, parseRef, parseScope, parseTarget, type ProjectCtx, type Ref, Vault, VaultError } from "./store.js";
@@ -41,8 +43,8 @@ const server = new McpServer(
       "Prefer run_with_secrets / write_env_file / materialize_file / http_request: they use secrets without showing them.",
       "Only call reveal_secret when the user explicitly needs to see a value.",
       "When the user wants to save or fetch a secret without exposing it to Claude, use sealed_save / sealed_fetch (macOS dialog / clipboard).",
-      "MISSING CREDENTIALS: if a task needs a login/secret that is not in the vault (check list_items first, or a tool returns 'not found'), immediately call request_credential with a sensible suggested_ref and reason — it opens secure dialogs asking the user for the save path and the values — then continue the task with the returned ref.",
-      "LOGIN FAILURES: never try a credential from a different environment/service (e.g. the draft password on develop), and after ONE rejected login stop retrying - many systems lock accounts after a few attempts. Tell the user, and offer request_credential on the same path to re-enter it (saves a new version; old versions are kept).",
+      "Enforced by the server (you cannot bypass these): a missing ref makes the server ask the user for it in a dialog before running your tool (just use the ref you need, e.g. staging-admin-panel/systemadmin#password); secrets are only sent to each service's allowed hosts; repeated use of a password asks the user to Allow/Block; an HTTP 401 locks the credential; set_secret/set_credential are refused unless enabled per project.",
+      "If a result says LOCKED or blocked: stop, do not retry and do not try another environment's credential — tell the user.",
       "Never ask the user to paste secrets into chat.",
     ].join(" "),
   },
@@ -54,6 +56,17 @@ const defaultArg = z.boolean().optional().describe("make this the default creden
 
 function applyTags(r: Ref, role?: string, isDefault?: boolean): void {
   if (role !== undefined || isDefault !== undefined) v().tagItem({ ...r, field: undefined }, { role, isDefault });
+}
+
+/** set_secret / set_credential carry values through the chat: refused unless the user enabled it per project. */
+function requireChatValues(r: Ref): void {
+  if (!v().chatValuesAllowed(r.tenant, r.project)) {
+    throw new VaultError(
+      `refused: storing values passed through the chat is disabled for ${r.tenant}/${r.project}. ` +
+        `Use request_credential or sealed_save (the user types the value in a dialog), or generate_secret. ` +
+        `The user can allow it with: cvault project chat-values ${r.tenant}/${r.project} on`,
+    );
+  }
 }
 
 function tagNote(role?: string, isDefault?: boolean): string {
@@ -201,6 +214,7 @@ tool(
   { ref: z.string(), value: z.string(), description: z.string().optional(), role: roleArg, default: defaultArg, cwd: cwdArg },
   ({ ref, value, description, role, default: isDefault, cwd }) => {
     const r = parseRef(ref, ctxFor(cwd));
+    requireChatValues(r);
     const ver = v().setSecret(r, value, description);
     applyTags(r, role, isDefault);
     return `stored ${formatRef(r)} (v${ver})${tagNote(role, isDefault)}`;
@@ -220,6 +234,7 @@ tool(
   },
   ({ ref, fields, description, role, default: isDefault, cwd }) => {
     const r = parseRef(ref, ctxFor(cwd));
+    requireChatValues(r);
     const ver = v().setCredential(r, fields, description);
     applyTags(r, role, isDefault);
     return `stored ${formatRef(r)} (v${ver}) with fields [${Object.keys(fields).join(", ")}]${tagNote(role, isDefault)}`;
@@ -311,7 +326,14 @@ tool(
   },
   async ({ command, env, cwd, timeout_seconds }) => {
     const dir = resolve(cwd ?? process.cwd());
-    return runWithSecrets(v(), { command, env, cwd: dir, timeoutMs: timeout_seconds * 1000, ctx: ctxFor(dir) });
+    const ctx = ctxFor(dir);
+    const p = await prepareUse(v(), Object.values(env), ctx, {
+      purpose: `run: ${command.length > 140 ? command.slice(0, 140) + "…" : command}`,
+      targetHosts: extractHosts(command),
+    });
+    const mapped = Object.fromEntries(Object.entries(env).map(([k, r]) => [k, p.remap.get(r) ?? r]));
+    const res = await runWithSecrets(v(), { command, env: mapped, cwd: dir, timeoutMs: timeout_seconds * 1000, ctx });
+    return p.notes.length ? { ...res, notes: p.notes } : res;
   },
 );
 
@@ -324,9 +346,13 @@ tool(
     force: z.boolean().default(false),
     cwd: cwdArg,
   },
-  ({ path, mapping, force, cwd }) => {
+  async ({ path, mapping, force, cwd }) => {
     const dir = resolve(cwd ?? process.cwd());
-    return writeEnvFile(v(), { target: resolve(dir, path), mapping, force, ctx: ctxFor(dir) });
+    const ctx = ctxFor(dir);
+    const p = await prepareUse(v(), Object.values(mapping), ctx, { purpose: `write ${path}` });
+    const mapped = Object.fromEntries(Object.entries(mapping).map(([k, r]) => [k, p.remap.get(r) ?? r]));
+    const res = writeEnvFile(v(), { target: resolve(dir, path), mapping: mapped, force, ctx });
+    return p.notes.length ? { ...res, notes: p.notes } : res;
   },
 );
 
@@ -341,9 +367,11 @@ tool(
     force: z.boolean().default(false).describe("allow writing into a git repo when not gitignored"),
     cwd: cwdArg,
   },
-  ({ ref, target_path, mode, overwrite, force, cwd }) => {
+  async ({ ref, target_path, mode, overwrite, force, cwd }) => {
     const dir = resolve(cwd ?? process.cwd());
-    return materializeFile(v(), { ref, target: target_path, mode: parseInt(mode, 8), overwrite, force, ctx: ctxFor(dir), cwd: dir });
+    const ctx = ctxFor(dir);
+    await prepareUse(v(), [ref], ctx, { purpose: `write file ${target_path ?? ""}`.trim(), noPrompt: true });
+    return materializeFile(v(), { ref, target: target_path, mode: parseInt(mode, 8), overwrite, force, ctx, cwd: dir });
   },
 );
 
@@ -358,8 +386,39 @@ tool(
     timeout_seconds: z.number().int().min(1).max(300).default(30),
     cwd: cwdArg,
   },
-  ({ method, url, headers, body, timeout_seconds, cwd }) =>
-    httpRequest(v(), { method: method.toUpperCase(), url, headers, body, timeoutMs: timeout_seconds * 1000, ctx: ctxFor(cwd) }),
+  async ({ method, url, headers, body, timeout_seconds, cwd }) => {
+    const ctx = ctxFor(cwd);
+    const texts = [url, ...Object.values(headers), body ?? ""];
+    const rawRefs = texts.flatMap((t) => [...t.matchAll(PLACEHOLDER)].map((m) => m[1]));
+    const shownUrl = url.replace(PLACEHOLDER, "{{secret}}");
+    const p = await prepareUse(v(), rawRefs, ctx, { purpose: `${method.toUpperCase()} ${shownUrl}` });
+    const rm = (s: string) => remapPlaceholders(s, p.remap, PLACEHOLDER);
+    const finalRefs = rawRefs.map((r) => p.remap.get(r) ?? r);
+    const parsedRefs = finalRefs.map((r) => parseRef(r, ctx));
+    let host = "";
+    const res = await httpRequest(v(), {
+      method: method.toUpperCase(),
+      url: rm(url),
+      headers: Object.fromEntries(Object.entries(headers).map(([k, val]) => [k, rm(val)])),
+      body: body === undefined ? undefined : rm(body),
+      timeoutMs: timeout_seconds * 1000,
+      ctx,
+      beforeSend: (u) => {
+        host = u.hostname;
+        checkHosts(v(), parsedRefs, [u.hostname]);
+      },
+    });
+    const notes = [...p.notes];
+    if (res.status === 401 && finalRefs.length) {
+      const locked = lockRejected(v(), finalRefs, ctx, host);
+      if (locked.length) {
+        notes.push(
+          `HTTP 401 - ${locked.join(", ")} is now LOCKED to prevent account lockout. Do not retry. Tell the user; they can re-enter it (request_credential on the same path) or run: cvault unlock <ref>`,
+        );
+      }
+    }
+    return notes.length ? { ...res, notes } : res;
+  },
 );
 
 // ---------- sealed (user ↔ vault via macOS UI; value never reaches the model) ----------
@@ -439,8 +498,16 @@ tool(
     timeout_seconds: z.number().int().min(10).max(600).default(120),
     cwd: cwdArg,
   },
-  ({ ref, mode, clear_after_seconds, timeout_seconds, cwd }) =>
-    sealedFetch(v(), parseRef(ref, ctxFor(cwd)), { mode, clearAfterSec: clear_after_seconds, timeoutSec: timeout_seconds }),
+  async ({ ref, mode, clear_after_seconds, timeout_seconds, cwd }) => {
+    const ctx = ctxFor(cwd);
+    const p = await prepareUse(v(), [ref], ctx, { purpose: `hand ${ref} to the user via ${mode}` });
+    const text = await sealedFetch(v(), parseRef(p.remap.get(ref) ?? ref, ctx), {
+      mode,
+      clearAfterSec: clear_after_seconds,
+      timeoutSec: timeout_seconds,
+    });
+    return p.notes.length ? `${text}\n${p.notes.join("\n")}` : text;
+  },
 );
 
 // ---------- reveal (opt-in per project) ----------
@@ -456,6 +523,7 @@ tool(
         `reveal is disabled for ${r.tenant}/${r.project}. Use run_with_secrets/write_env_file instead, or ask the user to run: cvault project reveal ${r.tenant}/${r.project} on`,
       );
     }
+    if (v().itemStatus(r) === "locked") v().resolveValue(r, "mcp"); // throws the LOCKED explanation
     v().audit("mcp", formatRef(r), `reveal-request: ${reason.slice(0, 200)}`);
     return v().getItem(r, "mcp");
   },

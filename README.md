@@ -145,7 +145,9 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 | `cvault project add <t/p> [--bind dir]` | create a project, optionally linked to a directory |
 | `cvault project bind <t/p> [dir] [--remove]` | link or unlink a directory |
 | `cvault project reveal <t/p> on\|off` | allow Claude to read plaintext (`reveal_secret`) |
-| `cvault service <t/p/s> [--url]` | create or update a service |
+| `cvault service <t/p/s> [--url] [--allow-host h…] [--add-host h…] [--clear-hosts]` | create or update a service, and restrict where its secrets may be sent |
+| `cvault unlock <ref>` | unlock a credential locked after a 401 or a blocked use |
+| `cvault project chat-values <t/p> on\|off` | allow Claude to store values it received in chat (off by default) |
 | `cvault set <ref> [--stdin] [-r role] [--default]` | store a secret (hidden prompt) |
 | `cvault set-cred <ref> -u user [-f k=v] [-r role] [--default]` | store a credential (password prompted, hidden) |
 | `cvault put-file <ref> <file>` | encrypt a file into the vault |
@@ -188,6 +190,17 @@ When a task needs a login that isn't in the vault, the session hook, server inst
 If a login is rejected, Claude is told to stop after **one** attempt (accounts often lock after a few), never to try another environment's credential, and to offer `request_credential` on the same path to re-enter it.
 
 Claude only receives the resulting ref.
+
+### Enforced rules (code, not instructions)
+The server enforces these itself, so Claude can't skip them:
+
+| Rule | How it's enforced |
+|---|---|
+| **Missing secret → ask the user** | Before `run_with_secrets` / `write_env_file` / `http_request` / `sealed_fetch` runs, missing refs trigger the `request_credential` dialogs automatically, then the original call continues (using a different path if you saved it elsewhere). |
+| **Allowed hosts per service** | `cvault service t/p/s --allow-host core-staging.example.com --add-host "*.staging.example.com"`. `http_request` checks the final URL; `run_with_secrets` checks the URLs, `-h/--host` flags and `user@host` in the command. Anything else is **blocked**, so a develop password can't reach staging. Only you can set this (CLI or explorer, not an MCP tool). |
+| **Lock after a rejected login** | An HTTP **401** from `http_request` locks every credential used in that request. Locked items are refused for Claude until you re-enter them (a new version unlocks) or run `cvault unlock <ref>`. You can still view and copy them in the CLI and explorer. |
+| **Use budget** | After **5** uses of a password/token field within **10 minutes** (any tool, including clipboard fills), a dialog asks **Allow / Block**. Allow gives 30 more minutes; Block locks the credential. Usernames don't count. |
+| **No values through chat** | `set_secret` / `set_credential` are refused unless you run `cvault project chat-values t/p on`. |
 
 ### Roles & defaults
 Give credentials a `role` (admin, viewer, tester, …) and mark one per service as the **default**. "Log in as viewer" picks the viewer item; with no role named, Claude uses the default and only asks when neither applies.
@@ -251,6 +264,8 @@ src/
   inject.ts   run / .env / file / http injection + scrubbing
   sealed.ts   macOS dialogs + clipboard with auto-clear
   export.ts   encrypted bundles, .env / JSON export, bundle import
+  enforce.ts  server-side rules: auto-prompt, allowed hosts, use budget, 401 lock
+  policy.ts   host matching / extraction, budget constants
   table.ts    table rendering
   db.ts       SQLite schema + migrations
 ```

@@ -85,6 +85,21 @@ tell me to activate
 display dialog theMsg with title "cvault" buttons {"OK"} default button "OK" with icon caution giving up after secs
 `;
 
+const APPROVE_SCRIPT = `${ENV_TEXT_HANDLER}
+set theMsg to envText("CVAULT_MSG")
+set secs to (system attribute "CVAULT_SECS") as integer
+tell me to activate
+set r to display dialog theMsg with title "cvault - allow again?" buttons {"Block", "Allow"} default button "Block" cancel button "Block" with icon caution giving up after secs
+if gave up of r then return "GAVE_UP"
+return button returned of r
+`;
+
+/** Ask the user to allow another use of a secret. Block, Cancel and timeout all mean "no". */
+export async function approveUse(message: string, timeoutSec = 120): Promise<boolean> {
+  const r = await osascript(APPROVE_SCRIPT, { CVAULT_MSG: message, CVAULT_SECS: String(timeoutSec) });
+  return r.code === 0 && r.stdout === "Allow";
+}
+
 /** Informational dialog (e.g. "entries did not match"). */
 async function notice(message: string, timeoutSec: number): Promise<void> {
   await osascript(NOTICE_SCRIPT, { CVAULT_MSG: message, CVAULT_SECS: String(Math.min(timeoutSec, 60)) });

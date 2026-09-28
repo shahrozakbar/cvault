@@ -160,7 +160,7 @@ export function materializeFile(
 
 // ---------- http_request ----------
 
-const PLACEHOLDER = /\{\{\s*secret:([^}\s]+)\s*\}\}/g;
+export const PLACEHOLDER = /\{\{\s*secret:([^}\s]+)\s*\}\}/g;
 
 export async function httpRequest(
   vault: Vault,
@@ -171,6 +171,8 @@ export async function httpRequest(
     body?: string;
     timeoutMs: number;
     ctx: ProjectCtx | null;
+    /** called with the final URL (placeholders filled) right before sending; throw to block */
+    beforeSend?: (url: URL) => void;
   },
 ) {
   const used = new Map<string, string>();
@@ -183,6 +185,15 @@ export async function httpRequest(
   const headers = Object.fromEntries(Object.entries(opts.headers).map(([k, v]) => [k, fill(v)]));
   const body = opts.body === undefined ? undefined : fill(opts.body);
   const secrets = [...used.values()];
+  if (opts.beforeSend) {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new VaultError(`invalid URL: ${scrub(url, secrets)}`);
+    }
+    opts.beforeSend(parsed);
+  }
 
   let res: Response;
   try {

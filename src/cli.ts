@@ -188,6 +188,16 @@ project
     print(`bound ${vault.bindPath(t, p, dir ?? process.cwd())} → ${t}/${p}`);
   });
 project
+  .command("chat-values <tenant/project> <on|off>")
+  .description("Allow/deny Claude to store values it received through the chat (set_secret / set_credential). Off by default.")
+  .action(async (s: string, state: string) => {
+    if (state !== "on" && state !== "off") throw new VaultError("state must be on or off");
+    const [t, p] = projectParts(s);
+    (await openVault()).setChatValues(t, p, state === "on");
+    print(`chat values ${state} for ${t}/${p}`);
+  });
+
+project
   .command("reveal <tenant/project> <on|off>")
   .description("Allow/deny Claude to read plaintext values (reveal_secret) for this project")
   .action(async (s: string, state: string) => {
@@ -203,11 +213,34 @@ program
   .option("-n, --name <name>")
   .option("-u, --url <url>")
   .option("--notes <notes>")
-  .action(async (s: string, o: { name?: string; url?: string; notes?: string }) => {
-    const p = parseScope(s);
-    if (p.length !== 3) throw new VaultError("expected tenant/project/service");
-    (await openVault()).ensureService(p[0], p[1], p[2], o);
-    print(`service ${s} ready`);
+  .option("--allow-host <host...>", "only allow this service's secrets to be sent to these hosts (repeatable, *.example.com wildcards)")
+  .option("--add-host <host...>", "add hosts to the allowed list")
+  .option("--clear-hosts", "remove the host restriction")
+  .action(
+    async (
+      s: string,
+      o: { name?: string; url?: string; notes?: string; allowHost?: string[]; addHost?: string[]; clearHosts?: boolean },
+    ) => {
+      const p = parseScope(s);
+      if (p.length !== 3) throw new VaultError("expected tenant/project/service");
+      const vault = await openVault();
+      vault.ensureService(p[0], p[1], p[2], { name: o.name, url: o.url, notes: o.notes });
+      let hosts: string[] | undefined;
+      if (o.clearHosts) hosts = vault.setAllowedHosts(p[0], p[1], p[2], []);
+      if (o.allowHost) hosts = vault.setAllowedHosts(p[0], p[1], p[2], o.allowHost);
+      if (o.addHost) hosts = vault.setAllowedHosts(p[0], p[1], p[2], [...vault.allowedHosts(p[0], p[1], p[2]), ...o.addHost]);
+      const current = hosts ?? vault.allowedHosts(p[0], p[1], p[2]);
+      print(`service ${s} ready — allowed hosts: ${current.length ? current.join(", ") : "any (no restriction)"}`);
+    },
+  );
+
+program
+  .command("unlock <ref>")
+  .description("Unlock a credential that was locked after a rejected login or blocked use")
+  .action(async (refStr: string) => {
+    const vault = await openVault();
+    const ref = parseRef(refStr, vault.resolveContext(process.cwd()));
+    print(vault.unlockItem(ref, "cli") ? `unlocked ${formatRef({ ...ref, field: undefined })}` : "not locked");
   });
 
 program
@@ -486,13 +519,21 @@ function contextFor(dir: string): string | null {
       description?: string;
       role?: string;
       default?: boolean;
+      locked?: { at: string; reason: string };
       version: number;
     }>;
     const prefix = `${ctx.tenant}/${ctx.project}/`;
+    const hostsOf = new Map<string, string[]>();
+    for (const i of items) {
+      const svc = i.ref.split("/")[2];
+      if (!hostsOf.has(svc)) hostsOf.set(svc, vault.allowedHosts(ctx.tenant, ctx.project, svc));
+    }
     const lines = items.slice(0, MAX_CONTEXT_ITEMS).map((i) => {
       const extra = [
         i.role ? `role: ${i.role}` : null,
         i.default ? "DEFAULT" : null,
+        i.locked ? `LOCKED since ${i.locked.at}: ${i.locked.reason} - do not use; tell the user` : null,
+        hostsOf.get(i.ref.split("/")[2])?.length ? `only for hosts: ${hostsOf.get(i.ref.split("/")[2])!.join(", ")}` : null,
         i.type === "credential" && i.fields ? `fields: ${i.fields.join(", ")}` : null,
         i.type === "file" && i.filename ? `file: ${i.filename}` : null,
         i.version > 1 ? `v${i.version}` : null,
@@ -510,8 +551,8 @@ function contextFor(dir: string): string | null {
         : null,
       "When a task needs one of these credentials, fetch it from cvault instead of asking the user or searching .env files:",
       "use run_with_secrets / write_env_file / http_request / materialize_file (values stay hidden), sealed_fetch / sealed_save when the user wants to get/set a value themselves.",
-      "If a credential the task needs is NOT listed above, immediately call mcp__cvault__request_credential (suggested_ref e.g. \"admin-panel/superadmin\", reason e.g. \"log into the admin panel\", fields if more than username/password are needed): it pops up secure dialogs where the user chooses the save path and enters the values. Then continue with the returned ref.",
-      "Never use a credential from another environment/service to log in, and stop after ONE rejected login (accounts lock after a few attempts) - tell the user and offer request_credential on the same path to re-enter it.",
+      "If a credential the task needs is NOT listed above, just use the ref it should have (e.g. staging-admin-panel/systemadmin#password): the cvault server itself asks the user for it in a dialog before running your tool. (request_credential does the same explicitly.)",
+      "Enforced by the server: secrets only go to each service's allowed hosts, repeated password use needs the user's approval, an HTTP 401 locks the credential. If a result says LOCKED or blocked, stop - never retry and never try another environment's credential.",
       "Never ask the user to paste a secret into chat.",
     ]
       .filter(Boolean)

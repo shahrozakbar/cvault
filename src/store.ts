@@ -616,6 +616,7 @@ export class Vault {
   }
 
   readFile(ref: Ref, source = "mcp"): { filename: string; content: Buffer; version: number } {
+    this.assertUsable(ref, source);
     const item = this.load(ref);
     if (item.type !== "file") throw new VaultError(`${formatRef(ref)} is a ${item.type}, not a file`);
     this.audit(source, formatRef(ref), `read-file v${item.version}`);
@@ -627,6 +628,7 @@ export class Vault {
    * (or the only field); use `#field` to pick another one.
    */
   resolveValue(ref: Ref, source = "mcp"): string {
+    this.assertUsable(ref, source);
     const item = this.load(ref);
     let value: string;
     if (item.type === "file") {
@@ -726,6 +728,102 @@ export class Vault {
     const v = this.writeItem(base, old.type, old.data, JSON.parse(old.meta), row.uid, source, blob);
     this.audit(source, formatRef(base), `rollback to v${version} → v${v}`);
     return v;
+  }
+
+  // ---------- enforced policies ----------
+
+  /** "ok" | "missing" (item/service/project absent) | "archived" | "locked", without throwing. */
+  itemStatus(ref: Ref): "ok" | "missing" | "archived" | "locked" {
+    try {
+      const row = this.itemRow(ref);
+      return JSON.parse(row.meta).locked ? "locked" : "ok";
+    } catch (e) {
+      if (e instanceof VaultError && /archived/.test(e.message)) return "archived";
+      if (e instanceof VaultError && /not found/.test(e.message)) return "missing";
+      throw e;
+    }
+  }
+
+  /** Lock an item (e.g. after a rejected login). Claude-side use is refused until unlocked or re-entered. */
+  lockItem(ref: Ref, reason: string, source = "mcp"): void {
+    const row = this.itemRow(ref);
+    const meta = JSON.parse(row.meta);
+    meta.locked = { at: new Date().toISOString().replace("T", " ").slice(0, 19), reason };
+    this.db.prepare("UPDATE items SET meta = ? WHERE id = ?").run(JSON.stringify(meta), row.id);
+    this.audit(source, formatRef({ ...ref, field: undefined, version: undefined }), `lock: ${reason}`);
+  }
+
+  unlockItem(ref: Ref, source = "cli"): boolean {
+    const row = this.itemRow(ref);
+    const meta = JSON.parse(row.meta);
+    if (!meta.locked) return false;
+    delete meta.locked;
+    this.db.prepare("UPDATE items SET meta = ? WHERE id = ?").run(JSON.stringify(meta), row.id);
+    this.audit(source, formatRef({ ...ref, field: undefined, version: undefined }), "unlock");
+    return true;
+  }
+
+  /** Throws if the item is locked and the caller is not the user's own CLI/UI. */
+  private assertUsable(ref: Ref, source: string): void {
+    if (source.startsWith("cli")) return;
+    const locked = JSON.parse(this.itemRow(ref).meta).locked as { at: string; reason: string } | undefined;
+    if (locked) {
+      const base = formatRef({ ...ref, field: undefined, version: undefined });
+      throw new VaultError(
+        `${base} is LOCKED since ${locked.at} (${locked.reason}). Do not retry. Ask the user to re-enter it (request_credential on the same path saves a new version and unlocks it) or to run: cvault unlock ${base}`,
+      );
+    }
+  }
+
+  /** Model-side uses of `ref#field` since `sinceUtc` (sqlite datetime text). */
+  countUses(ref: Ref, sinceUtc: string): number {
+    const refStr = formatRef({ ...ref, version: undefined });
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE ref = ? AND source LIKE 'mcp%' AND action LIKE 'use%' AND ts >= ?`)
+      .get(refStr, sinceUtc) as { n: number };
+    return row.n;
+  }
+
+  /** Last time the user approved further use of `ref#field` (sqlite datetime text) or null. */
+  lastApproval(ref: Ref): string | null {
+    const refStr = formatRef({ ...ref, version: undefined });
+    const row = this.db
+      .prepare(`SELECT MAX(ts) AS ts FROM audit_log WHERE ref = ? AND action = 'use-approved'`)
+      .get(refStr) as { ts: string | null };
+    return row.ts;
+  }
+
+  allowedHosts(tenant: string, project: string, service: string): string[] {
+    const pid = this.projectRow(tenant, project).id;
+    const row = this.db.prepare("SELECT allowed_hosts FROM services WHERE project_id = ? AND slug = ?").get(pid, service) as
+      | { allowed_hosts: string }
+      | undefined;
+    return row ? (JSON.parse(row.allowed_hosts) as string[]) : [];
+  }
+
+  setAllowedHosts(tenant: string, project: string, service: string, hosts: string[], source = "cli"): string[] {
+    const sid = this.serviceId(tenant, project, service);
+    const clean = [...new Set(hosts.map((h) => h.trim().toLowerCase()).filter(Boolean))];
+    this.db.prepare("UPDATE services SET allowed_hosts = ? WHERE id = ?").run(JSON.stringify(clean), sid);
+    this.audit(source, `${tenant}/${project}/${service}`, `allowed-hosts=${clean.join(",") || "(any)"}`);
+    return clean;
+  }
+
+  chatValuesAllowed(tenant: string, project: string): boolean {
+    try {
+      const row = this.db
+        .prepare(`SELECT p.allow_chat_values AS v FROM projects p JOIN tenants t ON t.id = p.tenant_id WHERE t.slug = ? AND p.slug = ?`)
+        .get(tenant, project) as { v: number } | undefined;
+      return !!row?.v;
+    } catch {
+      return false;
+    }
+  }
+
+  setChatValues(tenant: string, project: string, allow: boolean): void {
+    const pid = this.projectRow(tenant, project).id;
+    this.db.prepare("UPDATE projects SET allow_chat_values = ? WHERE id = ?").run(allow ? 1 : 0, pid);
+    this.audit("cli", `${tenant}/${project}`, `chat-values=${allow}`);
   }
 
   // ---------- audit ----------
