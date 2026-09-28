@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { z } from "zod";
 import { httpRequest, materializeFile, runWithSecrets, writeEnvFile } from "./inject.js";
 import { passwordFromEnv } from "./password.js";
-import { sealedFetch, sealedSave } from "./sealed.js";
+import { requestCredential, sealedFetch, sealedSave } from "./sealed.js";
 import { formatRef, parseRef, parseScope, parseTarget, type ProjectCtx, type Ref, Vault, VaultError } from "./store.js";
 
 let vault: Vault | null = null;
@@ -41,7 +41,8 @@ const server = new McpServer(
       "Prefer run_with_secrets / write_env_file / materialize_file / http_request: they use secrets without showing them.",
       "Only call reveal_secret when the user explicitly needs to see a value.",
       "When the user wants to save or fetch a secret without exposing it to Claude, use sealed_save / sealed_fetch (macOS dialog / clipboard).",
-      "Never ask the user to paste secrets into chat; suggest the `cvault set` CLI instead.",
+      "MISSING CREDENTIALS: if a task needs a login/secret that is not in the vault (check list_items first, or a tool returns 'not found'), immediately call request_credential with a sensible suggested_ref and reason — it opens secure dialogs asking the user for the save path and the values — then continue the task with the returned ref.",
+      "Never ask the user to paste secrets into chat.",
     ].join(" "),
   },
 );
@@ -59,6 +60,9 @@ function tagNote(role?: string, isDefault?: boolean): string {
   return parts.length ? ` [${parts.join(", ")}]` : "";
 }
 
+/** Tools that consume existing secrets: a "not found" there means the credential must be requested. */
+const USE_TOOLS = new Set(["run_with_secrets", "write_env_file", "materialize_file", "http_request", "reveal_secret", "sealed_fetch"]);
+
 function tool<S extends z.ZodRawShape>(
   name: string,
   description: string,
@@ -70,7 +74,11 @@ function tool<S extends z.ZodRawShape>(
       const result = await handler(args);
       return { content: [{ type: "text" as const, text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }] };
     } catch (e) {
-      const msg = e instanceof VaultError ? e.message : `internal error: ${(e as Error).message}`;
+      let msg = e instanceof VaultError ? e.message : `internal error: ${(e as Error).message}`;
+      if (USE_TOOLS.has(name) && /(item|service|project) ".*" not found/.test(msg)) {
+        msg +=
+          " → This credential is not in the vault yet. Call request_credential now (suggested_ref = the path you tried, reason = what you are doing) so the user can enter it in a secure dialog. Do not ask for it in chat.";
+      }
       return { isError: true, content: [{ type: "text" as const, text: msg }] };
     }
   }) as never);
@@ -357,9 +365,9 @@ tool(
 
 tool(
   "sealed_save",
-  "Ask the USER to type a secret into a native macOS masked dialog and store it. Use this whenever the user wants to save a secret without exposing it to Claude. Use ref#field to set one field of a credential.",
+  "Ask the USER to type a secret into native macOS dialogs and store it: first the save path (pre-filled with `ref`, editable), then the value (masked). Use this whenever the user wants to save a secret without exposing it to Claude. Use ref#field to set one field of a credential. For a whole missing login (username + password …) prefer request_credential.",
   {
-    ref: z.string(),
+    ref: z.string().optional().describe("suggested save path (the user can change it in the dialog)"),
     description: z.string().optional(),
     confirm: z.boolean().default(false).describe("ask the user to enter it twice"),
     timeout_seconds: z.number().int().min(10).max(600).default(120),
@@ -368,13 +376,55 @@ tool(
     cwd: cwdArg,
   },
   async ({ ref, description, confirm, timeout_seconds, role, default: isDefault, cwd }) => {
-    const r = parseRef(ref, ctxFor(cwd));
-    const res = await sealedSave(v(), r, { description, confirm, timeoutSec: timeout_seconds });
-    if (res.startsWith("stored")) {
-      applyTags(r, role, isDefault);
-      return res + tagNote(role, isDefault);
+    const ctx = ctxFor(cwd);
+    let suggested: Ref | null = null;
+    try {
+      suggested = ref ? parseRef(ref, ctx) : null;
+    } catch {
+      /* invalid suggestion: the user fixes it in the path dialog */
     }
-    return res;
+    const res = await sealedSave(v(), suggested, { description, confirm, timeoutSec: timeout_seconds, ctx });
+    if (res.ref) {
+      applyTags(res.ref, role, isDefault);
+      return res.text + tagNote(role, isDefault);
+    }
+    return res.text;
+  },
+);
+
+tool(
+  "request_credential",
+  "Use this AUTOMATICALLY whenever a task needs a credential or secret that is NOT in the vault (e.g. the user asks to log in and no matching item exists, or a tool returned 'not found'). Opens native macOS dialogs: first the save path (pre-filled with suggested_ref, the user can change it), then each field (username visible, password/token hidden). Values never reach Claude; the result tells you the ref to use next. Never ask the user to type secrets into the chat instead.",
+  {
+    suggested_ref: z
+      .string()
+      .optional()
+      .describe("suggested save path, e.g. admin-panel/superadmin inside a linked project or tenant/project/service/key"),
+    type: z.enum(["credential", "secret"]).default("credential").describe("credential = several fields (username/password/…); secret = one value (API key, token)"),
+    fields: z.array(z.string()).optional().describe('credential fields to ask for, default ["username","password"]; e.g. ["username","password","url"]'),
+    reason: z.string().optional().describe('shown in the dialog, e.g. "log into the draft admin panel"'),
+    description: z.string().optional(),
+    role: roleArg,
+    default: defaultArg,
+    timeout_seconds: z.number().int().min(10).max(600).default(180),
+    cwd: cwdArg,
+  },
+  async ({ suggested_ref, type, fields, reason, description, role, default: isDefault, timeout_seconds, cwd }) => {
+    const ctx = ctxFor(cwd);
+    let suggested: string | undefined;
+    try {
+      suggested = suggested_ref ? formatRef(parseRef(suggested_ref, ctx)) : undefined;
+    } catch {
+      suggested = suggested_ref; // shown as-is; the dialog validates it
+    }
+    const r = await requestCredential(v(), { suggestedRef: suggested, ctx, type, fields, reason, description, timeoutSec: timeout_seconds });
+    applyTags(r.ref, role, isDefault);
+    const refStr = formatRef(r.ref);
+    return (
+      `stored ${refStr} as v${r.version} (${r.created ? "new" : "updated"}${r.fields.length ? `; fields: ${r.fields.join(", ")}` : ""})${tagNote(role, isDefault)}. ` +
+      (r.adjustedFrom ? `The user typed "${r.adjustedFrom}", which was corrected to this 4-level path. ` : "") +
+      `Use ref "${refStr}"${r.fields.length ? ` (e.g. ${refStr}#${r.fields.includes("username") ? "username" : r.fields[0]})` : ""} with run_with_secrets / http_request / write_env_file.`
+    );
   },
 );
 

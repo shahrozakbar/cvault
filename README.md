@@ -97,7 +97,8 @@ Then just ask:
 | "create the .env for this project" | `write_env_file` (0600, refuses if not gitignored) | the list of keys written |
 | "list Stripe customers" | `http_request` with `Bearer {{secret:stripe/api_key}}` | the response, scrubbed |
 | "log into the admin panel as viewer" | picks `admin-panel/auditor` by role | nothing secret |
-| "save the OpenAI key **sealed**" | `sealed_save` opens a masked macOS dialog | `stored … as v1` |
+| "log into the staging panel" *(no credential stored yet)* | **automatically** calls `request_credential`: dialogs ask you for the save path (pre-filled), then username and password | `stored … as v1 (fields: username, password)` |
+| "save the OpenAI key **sealed**" | `sealed_save`: path dialog, then masked value | `stored … as v1` |
 | "give me the DB password **sealed**" | `sealed_fetch` copies it to your clipboard (auto-clears in 30s) | `copied` |
 
 ---
@@ -167,7 +168,7 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 |---|---|
 | Browse (no values) | `vault_status` · `resolve_context` · `list_tenants` · `list_projects` · `list_services` · `list_items` · `audit_log` |
 | Use (values hidden) | `run_with_secrets` · `write_env_file` · `materialize_file` · `http_request` |
-| Sealed (you ↔ vault) | `sealed_save` (masked dialog) · `sealed_fetch` (clipboard or dialog) |
+| Sealed (you ↔ vault) | `request_credential` (missing login: dialogs for path + fields) · `sealed_save` (path + masked value) · `sealed_fetch` (clipboard or dialog) |
 | Manage | `create_tenant` · `create_project` · `create_service` · `bind_project_path` · `set_secret` · `set_credential` · `generate_secret` · `put_file` · `tag_item` |
 | Versions & archive | `list_versions` · `rollback_secret` · `archive` · `restore` |
 | Reveal (opt-in) | `reveal_secret`: only when you've enabled it per project with the CLI |
@@ -178,6 +179,13 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 
 ### Refs
 `tenant/project/service/key[@version][#field]`. For example `acme/api/postgres/app#username` or `acme/api/stripe/api_key@2`. Inside a linked directory, the short form `service/key` works too. Credentials default to the `password` field.
+
+### Missing credentials
+When a task needs a login that isn't in the vault, the session hook, server instructions and "not found" errors all point Claude at `request_credential`. It opens native dialogs:
+1. **Path:** pre-filled with Claude's suggestion and editable. Paths with extra levels or messy characters are corrected automatically: `rezilens/develop/digrc-api-service/admin-panel/systemadmin` becomes `rezilens/digrc-api-service/develop-admin-panel/systemadmin`, with no second dialog. It only asks again when the intent can't be worked out.
+2. **Fields:** username (visible), password (hidden), plus any extra fields Claude asks for. For an existing item, leaving a field empty keeps its current value, and a new version is saved.
+
+Claude only receives the resulting ref.
 
 ### Roles & defaults
 Give credentials a `role` (admin, viewer, tester, …) and mark one per service as the **default**. "Log in as viewer" picks the viewer item; with no role named, Claude uses the default and only asks when neither applies.
