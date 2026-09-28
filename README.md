@@ -223,3 +223,9 @@ src/
   table.ts    table rendering
   db.ts       SQLite schema + migrations
 ```
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 shahroz Dhillon
