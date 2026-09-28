@@ -1,0 +1,33 @@
+{
+  "name": "vault-mcp",
+  "version": "0.1.0",
+  "description": "Local multi-tenant password manager MCP server (tenant → project → service → secrets/credentials/files)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cvault": "./dist/cli.js",
+    "vault-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/cli.js dist/index.js",
+    "watch": "tsc --watch",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^8.7.2",
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "better-sqlite3": "^13.0.3",
+    "commander": "^15.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  }
+}
