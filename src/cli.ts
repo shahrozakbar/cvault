@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { vaultHome } from "./db.js";
 import { auditTable, type ItemRowLike, itemsTable, printTable, versionsTable } from "./table.js";
+import { collectItems, decryptBundle, encryptBundle, type ExportFormat, importItems, toEnv, toJson, writeExport } from "./export.js";
 import { passwordFromEnv } from "./password.js";
 import { formatRef, parseRef, parseScope, parseTarget, Vault, VaultError } from "./store.js";
 
@@ -357,6 +358,91 @@ program
       n++;
     }
     print(`imported ${n} secrets into ${o.into}`);
+  });
+
+// ---------- export / import-bundle ----------
+
+async function promptLine(question: string): Promise<string> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return (await rl.question(question)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+/** Bundle passphrase from CVAULT_BUNDLE_PASSPHRASE (scripting) or a hidden prompt. */
+async function bundlePassphrase(confirmIt: boolean): Promise<string> {
+  const fromEnv = process.env.CVAULT_BUNDLE_PASSPHRASE;
+  delete process.env.CVAULT_BUNDLE_PASSPHRASE;
+  if (fromEnv) return fromEnv;
+  const pw = await promptHidden("Bundle passphrase: ");
+  if (confirmIt && (await promptHidden("Repeat passphrase: ")) !== pw) throw new VaultError("passphrases do not match");
+  return pw;
+}
+
+program
+  .command("export [scope]")
+  .description("Export secrets as an encrypted bundle (default), .env or JSON. Scope: tenant | tenant/project | tenant/project/service (default: everything)")
+  .option("-f, --format <format>", "bundle | env | json", "bundle")
+  .option("-o, --out <file>", "output file (default: cvault-<scope>.<cvault|env|json>)")
+  .option("--stdout", "print to stdout instead of writing a file (env/json only)")
+  .option("--force", "overwrite an existing file")
+  .option("-y, --yes", "skip the confirmation for plaintext formats")
+  .action(async (scope: string | undefined, o: { format: string; out?: string; stdout?: boolean; force?: boolean; yes?: boolean }) => {
+    const format = o.format as ExportFormat;
+    if (!["bundle", "env", "json"].includes(format)) throw new VaultError("format must be bundle, env or json");
+    if (format === "bundle" && o.stdout) throw new VaultError("bundles are written to a file; use -o");
+    const vault = await openVault();
+    const parts = scope ? parseScope(scope) : [];
+    const label = parts.join("/") || "the whole vault";
+    const plaintext = format !== "bundle";
+    if (plaintext && !o.yes) {
+      if (!process.stdin.isTTY) throw new VaultError("plaintext export needs confirmation — pass --yes");
+      const ans = await promptLine(`Export ${label} as PLAINTEXT ${format}? Anyone with the file can read every secret. Type "yes": `);
+      if (ans !== "yes") return print("cancelled — nothing exported");
+    }
+    const items = collectItems(vault, parts);
+    if (!items.length) return print(`nothing to export in ${label}`);
+    let content: string;
+    let note = "";
+    if (format === "bundle") {
+      content = encryptBundle(items, await bundlePassphrase(true));
+    } else if (format === "env") {
+      const r = toEnv(items, parts.length);
+      content = r.text;
+      if (r.skipped.length) note = `\nskipped ${r.skipped.length} file item(s) (not representable in .env): ${r.skipped.join(", ")}`;
+    } else {
+      content = toJson(items);
+    }
+    if (o.stdout) {
+      process.stdout.write(content);
+      if (note) console.error(note.trim());
+      return;
+    }
+    const ext = format === "bundle" ? "cvault" : format;
+    const path = writeExport(o.out ?? `cvault-${parts.join("-") || "all"}.${ext}`, content, { plaintext, overwrite: !!o.force });
+    const files = items.filter((i) => i.type === "file").length;
+    print(
+      `exported ${items.length} item(s) from ${label} → ${path} (${format}${format === "bundle" ? ", encrypted" : ", PLAINTEXT"}, mode 600)` +
+        (format === "bundle" && files ? `\nincludes ${files} file(s)` : "") +
+        note +
+        (format === "bundle" ? `\nrestore with: cvault import-bundle ${path}` : ""),
+    );
+  });
+
+program
+  .command("import-bundle <file>")
+  .description("Import an encrypted bundle created by `cvault export`. Existing items get a new version.")
+  .option("--into <target>", "remap into another tenant (acme2) or tenant/project (acme2/api)")
+  .action(async (file: string, o: { into?: string }) => {
+    const vault = await openVault();
+    const into = o.into ? parseScope(o.into) : undefined;
+    if (into && into.length > 2) throw new VaultError("--into must be tenant or tenant/project");
+    const items = decryptBundle(readFileSync(file, "utf8"), await bundlePassphrase(false));
+    const r = importItems(vault, items, { into });
+    print(`imported ${r.imported} item(s): ${r.created} new, ${r.updated} updated (saved as new versions)`);
   });
 
 program

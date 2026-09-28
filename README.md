@@ -40,7 +40,7 @@ tenant (client / workspace)
 - [Interactive explorer](#interactive-explorer)
 - [CLI reference](#cli-reference)
 - [MCP tools](#mcp-tools)
-- [Concepts](#concepts): refs · roles & defaults · versioning · archive · directory linking
+- [Concepts](#concepts): refs · roles & defaults · versioning · archive · export & import · directory linking
 - [Security model](#security-model)
 - [Development](#development)
 
@@ -124,10 +124,11 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 
 - **Navigate:** opens at the project linked to your current directory; search across all items by ref, role or description.
 - **Copy** any secret or credential field. The clipboard auto-clears after 30s, even if you've already quit.
+- **Export:** an encrypted bundle, `.env` or JSON for a project or the whole vault.
 - **View** all fields, version history and the audit log as tables.
 - **Edit** values and fields, add or remove fields, replace files. Each change saves a new version.
 - **Labels:** role, default and description, without creating a new version.
-- **Manage:** create tenants, projects, services and items; link directories; toggle Claude reveal; archive and restore; roll back.
+- **Manage:** create tenants, projects, services and items; link directories; toggle Claude reveal; archive and restore; roll back; **export** a project or the whole vault.
 - **Keys:** `↑↓` move · `⏎` select · **`Esc`** back / cancel the current action · `Ctrl+C` quit.
 - **Responsive:** tables drop low-priority columns on narrow terminals.
 
@@ -152,6 +153,8 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 | `cvault versions <ref>` · `cvault rollback <ref> <N>` | history and roll back |
 | `cvault archive <target>` · `cvault restore <target>` | archive or restore a tenant, project, service or item |
 | `cvault import .env --into <t/p/s>` | bulk-import a `.env` file |
+| `cvault export [scope] [-f bundle\|env\|json] [-o file]` | export a tenant, project, service or everything ([details](#export--import)) |
+| `cvault import-bundle <file> [--into t or t/p]` | restore an encrypted bundle (existing items get a new version) |
 | `cvault context [dir]` | preview what the session hook injects |
 | `cvault audit [-n N] [-r prefix]` | access log |
 | `cvault backup <dir>` · `cvault change-password` | maintenance |
@@ -185,6 +188,23 @@ Every write creates version N+1. Old versions stay encrypted (and old files are 
 ### Archive, never delete
 Archive a tenant, project, service or single item. It's hidden and unusable but fully restorable. Archiving a tenant hides everything under it.
 
+### Export & import
+
+| Format | Encrypted? | Contents | Typical use |
+|---|---|---|---|
+| `bundle` *(default)* | ✅ passphrase → scrypt → AES-256-GCM | every item incl. **files**, roles, defaults, descriptions | backups, moving to another machine, handing a project to a teammate |
+| `env` | ❌ plaintext | `KEY=value`; credentials become `KEY_FIELD`; files skipped | seeding a `.env` |
+| `json` | ❌ plaintext | nested `tenant → project → service → item` | scripts and other tools |
+
+```bash
+cvault export acme/api                         # → cvault-acme-api.cvault (asks for a passphrase)
+cvault import-bundle cvault-acme-api.cvault    # on the other machine
+cvault import-bundle backup.cvault --into acme-staging/api   # remap tenant/project
+cvault export acme/api/stripe -f env --yes --stdout          # STRIPE keys as KEY=value
+```
+
+`.env` names are built from the path below the export scope: exporting a project gives `STRIPE_API_KEY` and `ADMIN_PANEL_SUPERADMIN_PASSWORD`, while exporting one service gives `API_KEY` and `SUPERADMIN_PASSWORD`. Name clashes are an error, never a silent overwrite. Plaintext exports need confirmation (`--yes` in scripts), are written with mode 600, and are refused inside a git repo unless the file is gitignored. For scripts, set the bundle passphrase with `CVAULT_BUNDLE_PASSPHRASE`. Export is deliberately **not** an MCP tool, so Claude can't dump the vault. In the explorer: **Export…** on the home page and on each project page.
+
 ### Directory linking
 `cvault project bind` links a directory (and its subdirectories; the most specific link wins) to a project. This drives short refs, the explorer's start page and the SessionStart hook.
 
@@ -207,7 +227,7 @@ Archive a tenant, project, service or single item. It's hidden and unusable but 
 
 ```bash
 npm run build        # tsc → dist/
-npm test             # vitest (crypto, versioning, archive, roles, injection, scrubbing)
+npm test             # vitest (crypto, versioning, archive, roles, export/import, injection, scrubbing)
 npx @modelcontextprotocol/inspector node dist/index.js
 ```
 
@@ -220,6 +240,7 @@ src/
   crypto.ts   scrypt + AES-256-GCM
   inject.ts   run / .env / file / http injection + scrubbing
   sealed.ts   macOS dialogs + clipboard with auto-clear
+  export.ts   encrypted bundles, .env / JSON export, bundle import
   table.ts    table rendering
   db.ts       SQLite schema + migrations
 ```

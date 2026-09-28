@@ -574,13 +574,25 @@ export class Vault {
     const st = statSync(srcPath);
     if (!st.isFile()) throw new VaultError(`${srcPath} is not a file`);
     if (st.size > MAX_FILE_BYTES) throw new VaultError(`file too large (max ${MAX_FILE_BYTES / 1024 / 1024} MB)`);
+    return this.putFileContent(ref, basename(srcPath), readFileSync(srcPath), description, source);
+  }
+
+  /** Store file content from memory (used by bundle import — no plaintext temp file). */
+  putFileContent(
+    ref: Ref,
+    filename: string,
+    content: Buffer,
+    description?: string,
+    source = "mcp",
+  ): { filename: string; size: number; version: number } {
+    if (content.length > MAX_FILE_BYTES) throw new VaultError(`file too large (max ${MAX_FILE_BYTES / 1024 / 1024} MB)`);
     const uid = this.uidFor(ref);
-    const blob = encrypt(this.dek, readFileSync(srcPath), uid);
-    const meta: Record<string, unknown> = { filename: basename(srcPath), size: st.size };
+    const blob = encrypt(this.dek, content, uid);
+    const meta: Record<string, unknown> = { filename, size: content.length };
     if (description) meta.description = description;
     const version = this.writeItem(ref, "file", null, meta, uid, source, blob);
     this.audit(source, formatRef(ref), `put-file v${version}`);
-    return { filename: basename(srcPath), size: st.size, version };
+    return { filename, size: content.length, version };
   }
 
   /** Decrypt the current version, or `ref.version` if given. */

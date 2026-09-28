@@ -3,6 +3,7 @@ import { emitKeypressEvents } from "node:readline";
 import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { collectItems, encryptBundle, type ExportFormat, toEnv, toJson, writeExport } from "./export.js";
 import { copyToClipboard } from "./sealed.js";
 import { alignedRows, auditTable, type Cell, humanSize, itemsTable, renderTable } from "./table.js";
 import { type ItemType, parseRef, type Ref, Vault, VaultError } from "./store.js";
@@ -248,6 +249,7 @@ async function mainMenu(vault: Vault): Promise<void> {
       section("Overview"),
       { name: "All items (table)", value: "table" },
       { name: "Audit log (last 30)", value: "audit" },
+      { name: "Export the whole vault…", value: "export" },
       new Separator(" "),
       { name: dim("Quit"), value: "quit" },
     ]);
@@ -257,6 +259,7 @@ async function mainMenu(vault: Vault): Promise<void> {
     if (a === "browse") await tenantsMenu(vault);
     if (a === "table") note(itemsTable(allItems(vault), "All items"));
     if (a === "audit") note(auditTable(vault.auditLog(30) as never));
+    if (a === "export") await act(() => exportFlow(vault, []));
   }
 }
 
@@ -427,6 +430,7 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
       section("Actions"),
       { name: "+ New item…", value: "__new" },
       { name: "Services…", value: "__services" },
+      { name: "Export this project…", value: "__export" },
       ...(linkedHere ? [] : [{ name: `Link this directory ${dim(tilde(process.cwd()))}`, value: "__bind" }]),
       { name: `Turn Claude reveal ${info.allow_reveal ? "OFF" : "ON"}`, value: "__reveal" },
       { name: yellow("Archive this project"), value: "__archive" },
@@ -435,6 +439,7 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
     if (a === BACK) return;
     if (a === "__new") await act(() => newItemFlow(vault, tenant, project));
     else if (a === "__services") await servicesMenu(vault, tenant, project);
+    else if (a === "__export") await act(() => exportFlow(vault, [tenant, project]));
     else if (a === "__bind") await act(() => ok(`linked ${tilde(vault.bindPath(tenant, project, process.cwd()))}`));
     else if (a === "__reveal") {
       await act(() => {
@@ -602,6 +607,46 @@ async function newFile(vault: Vault, t: string, p: string, s: string): Promise<v
   const description = await input({ message: "Description (optional)" });
   const r = vault.putFile({ tenant: t, project: p, service: s, key }, resolve(src), description || undefined, SOURCE);
   ok(`stored ${r.filename} (${humanSize(r.size)}) as ${t}/${p}/${s}/${key}`);
+}
+
+// ---------- export ----------
+
+async function exportFlow(vault: Vault, scope: string[]): Promise<void> {
+  const label = scope.join("/") || "the whole vault";
+  const format = await menu<ExportFormat>(`Export ${label} as…`, [
+    { name: `Encrypted bundle ${dim("(recommended) passphrase-protected, includes files · restore with cvault import-bundle")}`, value: "bundle" },
+    { name: `.env file ${dim("PLAINTEXT KEY=value — credentials become KEY_FIELD, files skipped")}`, value: "env" },
+    { name: `JSON ${dim("PLAINTEXT, nested by tenant/project/service")}`, value: "json" },
+  ]);
+  const plaintext = format !== "bundle";
+  const ext = format === "bundle" ? "cvault" : format;
+  const target = resolve(await input({ message: "Save to", default: `./cvault-${scope.join("-") || "all"}.${ext}` }));
+  if (plaintext && !(await confirm({ message: yellow(`Write ${label} as PLAINTEXT? Anyone with the file can read every secret.`), default: false }))) {
+    note(dim("↩ cancelled — nothing exported"));
+    return;
+  }
+  let overwrite = false;
+  if (existsSync(target)) {
+    overwrite = await confirm({ message: `${tilde(target)} exists — overwrite?`, default: false });
+    if (!overwrite) return void note(dim("↩ cancelled — nothing exported"));
+  }
+  let passphrase = "";
+  if (format === "bundle") {
+    passphrase = await password({ message: "Bundle passphrase (min 8 chars)", mask: "•", validate: (v) => v.length >= 8 || "at least 8 characters" });
+    if ((await password({ message: "Repeat passphrase", mask: "•" })) !== passphrase) throw new VaultError("passphrases do not match — nothing exported");
+  }
+  const items = collectItems(vault, scope, SOURCE);
+  if (!items.length) return void note(dim(`nothing to export in ${label}`));
+  let content: string;
+  let extra = "";
+  if (format === "bundle") content = encryptBundle(items, passphrase);
+  else if (format === "env") {
+    const r = toEnv(items, scope.length);
+    content = r.text;
+    if (r.skipped.length) extra = ` · skipped ${r.skipped.length} file item(s)`;
+  } else content = toJson(items);
+  const path = writeExport(target, content, { plaintext, overwrite });
+  ok(`exported ${items.length} item(s) from ${label} → ${tilde(path)} (${plaintext ? "PLAINTEXT" : "encrypted"}, mode 600)${extra}`);
 }
 
 // ---------- item ----------

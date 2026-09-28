@@ -111,7 +111,7 @@ function guardTarget(target: string, force: boolean): void {
   }
 }
 
-function quoteEnv(v: string): string {
+export function quoteEnv(v: string): string {
   if (/^[A-Za-z0-9_./:@+-]*$/.test(v)) return v;
   return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/\r?\n/g, "\\n")}"`;
 }
