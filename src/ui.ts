@@ -337,8 +337,136 @@ async function tenantsMenu(vault: Vault): Promise<void> {
       }
       continue;
     }
-    await projectsMenu(vault, t.tenant);
+    await envsMenu(vault, t.tenant);
   }
+}
+
+const NO_ENV = "__none";
+const envLabel = (env: string) => (env === NO_ENV || !env ? "(no environment)" : env);
+
+interface SvcRow {
+  project: string;
+  key: string;
+  service: string;
+  environment: string | null;
+  url: string | null;
+  items: number;
+  archived_at?: string;
+}
+
+/** Every service of a tenant across its projects (optionally including archived). */
+function tenantServices(vault: Vault, tenant: string, includeArchived = false): SvcRow[] {
+  const projects = vault.listProjects(tenant) as unknown as Array<{ project: string }>;
+  return projects.flatMap((p) =>
+    (vault.listServices(tenant, p.project, includeArchived) as unknown as Omit<SvcRow, "project">[]).map((sv) => ({ ...sv, project: p.project })),
+  );
+}
+
+/** Tenant page: environments first (path order tenant/env/project/service/key). */
+async function envsMenu(vault: Vault, tenant: string): Promise<void> {
+  for (;;) {
+    const svcs = tenantServices(vault, tenant);
+    const envs = new Map<string, { projects: Set<string>; services: number; items: number }>();
+    for (const sv of svcs) {
+      const e = sv.environment ?? NO_ENV;
+      const g = envs.get(e) ?? { projects: new Set<string>(), services: 0, items: 0 };
+      g.projects.add(sv.project);
+      g.services++;
+      g.items += sv.items;
+      envs.set(e, g);
+    }
+    const order = [...envs.keys()].sort((a, b) => (a === NO_ENV ? 1 : b === NO_ENV ? -1 : a.localeCompare(b)));
+    page(vault, ["home", tenant]);
+    const a = await menu<string>("Pick an environment", [
+      ...tableSection(
+        ["ENVIRONMENT", "PROJECTS", "SERVICES", "ITEMS"],
+        order.map((e) => {
+          const g = envs.get(e)!;
+          return { cells: [e === NO_ENV ? dim(envLabel(e)) : cyan(e), [...g.projects].join(", "), g.services, g.items], value: e };
+        }),
+        { 1: 60 },
+        "no services yet — add one below",
+      ),
+      section("Actions"),
+      { name: "+ New environment…", value: "__newenv" },
+      { name: "Projects & settings…", value: "__projects" },
+      backChoice,
+    ]);
+    if (a === BACK) return;
+    if (a === "__projects") await projectsMenu(vault, tenant);
+    else if (a === "__newenv") {
+      await act(async () => {
+        const env = await slugPrompt("Environment name (e.g. develop, staging, prod)");
+        ok(`service ${await createServiceIn(vault, tenant, env)} created`);
+      });
+    } else await envServicesMenu(vault, tenant, a);
+  }
+}
+
+/** Environment page: the services of every project in this environment. */
+async function envServicesMenu(vault: Vault, tenant: string, env: string): Promise<void> {
+  const want = env === NO_ENV ? null : env;
+  for (;;) {
+    const svcs = tenantServices(vault, tenant, true).filter((sv) => (sv.environment ?? null) === want);
+    page(vault, ["home", tenant, envLabel(env)]);
+    const a = await menu<string>("Pick a service", [
+      ...tableSection(
+        ["SERVICE", "PROJECT", "URL", "ITEMS", "ALLOWED HOSTS", "STATUS"],
+        svcs.map((sv) => ({
+          cells: [
+            sv.service,
+            sv.project,
+            sv.url,
+            sv.items,
+            vault.allowedHosts(tenant, sv.project, sv.key).join(", "),
+            status(sv.archived_at),
+          ],
+          value: `${sv.project}\u0000${sv.key}`,
+        })),
+        { 2: 50, 4: 60 },
+        "no services in this environment",
+        ["URL", "ALLOWED HOSTS", "PROJECT"],
+      ),
+      section("Actions"),
+      { name: `+ New service in ${envLabel(env)}…`, value: "__new" },
+      backChoice,
+    ]);
+    if (a === BACK) return;
+    if (a === "__new") {
+      await act(async () => ok(`service ${await createServiceIn(vault, tenant, want ?? "")} created`));
+      continue;
+    }
+    const [project, key] = a.split("\u0000");
+    const sv = svcs.find((x) => x.project === project && x.key === key)!;
+    if (sv.archived_at) {
+      if (await confirm({ message: `Service ${formatServicePath(tenant, project, key)} is archived. Restore it?`, default: false })) {
+        await act(() => ok(vault.restore([tenant, project, key], SOURCE)));
+      }
+      continue;
+    }
+    await serviceMenu(vault, tenant, project, key);
+  }
+}
+
+/** Create a service in a given environment ("" = none), asking which project it belongs to. */
+async function createServiceIn(vault: Vault, tenant: string, env: string): Promise<string> {
+  const projects = (vault.listProjects(tenant) as unknown as Array<{ project: string }>).map((p) => p.project);
+  let project = projects.length === 1 ? projects[0] : "";
+  if (!project) {
+    project = await menu<string>("Which project?", [
+      ...projects.map((p) => ({ name: p, value: p })),
+      { name: "+ New project…", value: "__new" },
+    ]);
+    if (project === "__new") {
+      project = await slugPrompt("Project slug (e.g. api-service)");
+      vault.ensureProject(tenant, project);
+    }
+  }
+  const slug = await slugPrompt("Service slug (e.g. postgres, stripe, admin-panel)");
+  const url = await input({ message: "URL (optional)" });
+  const key = serviceKey(env || undefined, slug);
+  vault.ensureService(tenant, project, key, url ? { url } : {});
+  return formatServicePath(tenant, project, key);
 }
 
 async function projectsMenu(vault: Vault, tenant: string): Promise<void> {
