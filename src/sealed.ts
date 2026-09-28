@@ -124,18 +124,29 @@ export function suggestPath(answer: string, ctx: ProjectCtx | null): string | nu
   const rest = parts.slice(0, -1);
   let tenant: string;
   let project: string;
-  let middle: string[];
+  let env: string | undefined;
+  let service: string;
+  const fromMiddle = (middle: string[]) => {
+    // [service] | [env, service] | [env, service, more…] (extra levels fold into the service)
+    if (middle.length === 1) return { env: undefined, service: middle[0] };
+    return { env: middle[0], service: middle.slice(1).join("-") };
+  };
   if (ctx && (rest.includes(ctx.tenant) || rest.includes(ctx.project) || rest.length <= 2)) {
+    // inside a linked project: tenant/project names are recognised wherever they were typed
     tenant = ctx.tenant;
     project = ctx.project;
-    middle = rest.filter((p) => p !== ctx.tenant && p !== ctx.project);
-  } else if (rest.length >= 3) {
-    [tenant, project, ...middle] = rest;
+    const middle = rest.filter((p) => p !== ctx.tenant && p !== ctx.project);
+    if (!middle.length) return null;
+    ({ env, service } = fromMiddle(middle));
+  } else if (rest.length === 3) {
+    [tenant, project, service] = rest;
+  } else if (rest.length >= 4) {
+    [tenant, env, project] = rest;
+    service = rest.slice(3).join("-");
   } else {
     return null;
   }
-  if (!middle.length) return null;
-  const fixed = [slug(tenant), slug(project), slug(middle.join("-")), keyOf(key)];
+  const fixed = [slug(tenant), env ? slug(env) : null, slug(project), slug(service), keyOf(key)].filter((x) => x !== null) as string[];
   if (fixed.some((p) => !p)) return null;
   const s = fixed.join("/") + (field ? `#${field}` : "");
   return s === answer ? null : s;
@@ -143,9 +154,8 @@ export function suggestPath(answer: string, ctx: ProjectCtx | null): string | nu
 
 function pathError(answer: string, e: Error, ctx: ProjectCtx | null): string {
   const levels = answer.split("#")[0].split("/").filter(Boolean).length;
-  if (levels > 4) return `A path has exactly 4 levels: tenant / project / service / key (you entered ${levels}).`;
-  if (levels === 3) return `3 levels is ambiguous. Use tenant/project/service/key${ctx ? " or service/key" : ""}.`;
-  if (levels < 2 || (levels === 2 && !ctx)) return "Use tenant/project/service/key (this directory is not linked to a project, so service/key alone is not enough).";
+  if (levels > 5) return `A path has at most 5 levels: tenant / env / project / service / key (you entered ${levels}).`;
+  if (levels < 4 && !ctx) return "Use tenant/env/project/service/key (this directory is not linked to a project, so a short path is not enough).";
   return e.message.replace(/ \(expected .*\)$/, "");
 }
 
@@ -161,10 +171,12 @@ async function askPath(opts: {
   ctx: ProjectCtx | null;
   allowField: boolean;
   timeoutSec: number;
+  /** extra semantic check (e.g. project/environment swapped); return an error message to reject */
+  validate?: (ref: Ref) => string | null;
 }): Promise<{ ref: Ref; adjustedFrom?: string }> {
-  const format = `tenant/project/service/key${opts.allowField ? "[#field]" : ""}`;
-  const shortHint = opts.ctx ? `\n(or just service/key inside ${opts.ctx.tenant}/${opts.ctx.project})` : "";
-  const valid = (ref: Ref) => !ref.version && (!ref.field || opts.allowField);
+  const format = `tenant/env/project/service/key${opts.allowField ? "[#field]" : ""}  (env is optional)`;
+  const shortHint = opts.ctx ? `\n(inside ${opts.ctx.tenant}/${opts.ctx.project} also: env/service/key or service/key)` : "";
+  const valid = (ref: Ref) => !ref.version && (!ref.field || opts.allowField) && !opts.validate?.(ref);
   let answer = opts.suggested;
   let error = "";
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -182,6 +194,8 @@ async function askPath(opts: {
       const ref = parseRef(answer, opts.ctx);
       if (ref.version) throw new VaultError("Don't include @version - saving always creates a new version.");
       if (ref.field && !opts.allowField) throw new VaultError("Don't include #field here - you'll be asked for each field next.");
+      const problem = opts.validate?.(ref);
+      if (problem) throw new Error(problem);
       return { ref };
     } catch (e) {
       const explicit = e instanceof VaultError && /^Don't/.test(e.message);
@@ -278,6 +292,18 @@ function existing(vault: Vault, ref: Ref): { type: string; version: number; fiel
   }
 }
 
+/** Reject paths whose project doesn't exist but whose environment slot names an existing project (swapped order). */
+function swappedProject(vault: Vault) {
+  return (ref: Ref): string | null => {
+    if (!ref.env) return null;
+    const projects = (vault.listProjects(ref.tenant) as unknown as Array<{ project: string }>).map((p) => p.project);
+    if (!projects.includes(ref.project) && projects.includes(ref.env)) {
+      return `"${ref.env}" is a project and "${ref.project}" looks like an environment - the order is tenant/env/project/service/key.`;
+    }
+    return null;
+  };
+}
+
 /**
  * Collect a missing credential/secret from the user through native dialogs: first the path
  * (pre-filled, editable), then each field. Values never reach the model.
@@ -299,7 +325,14 @@ export async function requestCredential(
     const intro = `Claude needs ${what}${opts.reason ? ` to ${opts.reason}` : ""}.\nIt is saved in your encrypted vault - Claude never sees the values.`;
     const suggested =
       opts.suggestedRef ?? (opts.ctx ? `${opts.ctx.tenant}/${opts.ctx.project}/service/key` : "tenant/project/service/key");
-    const { ref, adjustedFrom } = await askPath({ intro, suggested, ctx: opts.ctx, allowField: false, timeoutSec: opts.timeoutSec });
+    const { ref, adjustedFrom } = await askPath({
+      intro,
+      suggested,
+      ctx: opts.ctx,
+      allowField: false,
+      timeoutSec: opts.timeoutSec,
+      validate: swappedProject(vault),
+    });
     const target = formatRef(ref);
     const prev = existing(vault, ref);
     if (prev && prev.type !== (opts.type === "credential" ? "credential" : "secret")) {
@@ -381,6 +414,7 @@ export async function sealedSave(
       ctx: opts.ctx,
       allowField: true,
       timeoutSec: opts.timeoutSec,
+      validate: swappedProject(vault),
     }));
     const what = ref.field ? `field "${ref.field}" of ${formatRef({ ...ref, field: undefined })}` : formatRef(ref);
     value = await ask({ title: "cvault - save secret", message: `Enter the value for ${what}.`, hidden: true, ok: "Save", timeoutSec: opts.timeoutSec });

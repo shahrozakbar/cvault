@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { collectItems, encryptBundle, type ExportFormat, toEnv, toJson, writeExport } from "./export.js";
 import { copyToClipboard } from "./sealed.js";
 import { alignedRows, auditTable, type Cell, humanSize, itemsTable, renderTable } from "./table.js";
-import { type ItemType, parseRef, type Ref, Vault, VaultError } from "./store.js";
+import { type ItemType, type Ref, type Scope, Vault, VaultError, formatRef, formatScope, formatServicePath, parseRef, serviceKey, splitServiceKey } from "./store.js";
 
 /**
  * Interactive explorer. Every menu is a "page": the screen is cleared and redrawn with a header,
@@ -175,7 +175,15 @@ function tableSection<T extends string | number>(
 }
 
 const status = (archived?: string) => (archived ? yellow("archived") : green("active"));
-const keyOf = (ref: string) => ref.split("/").slice(3).join("/");
+const keyOf = (ref: string) => parseRef(ref).key;
+/** Build a ref from a composite service key ("env/service" or "service"). */
+const mkRef = (tenant: string, project: string, svcKey: string, key: string): Ref => {
+  const { env, service } = splitServiceKey(svcKey);
+  return env ? { tenant, env, project, service, key } : { tenant, project, service, key };
+};
+/** Breadcrumb segments for a ref: tenant › [env ›] project › service. */
+const crumbsOf = (r: { tenant: string; env?: string; project: string; service: string }) =>
+  [r.tenant, ...(r.env ? [r.env] : []), r.project, r.service];
 const fieldsOrFile = (i: ItemInfo) =>
   i.type === "credential" ? i.fields?.join(", ") : i.type === "file" ? `${i.filename} (${humanSize(i.size)})` : "";
 
@@ -206,8 +214,10 @@ const secretPrompt = (message: string) => password({ message, mask: "•", valid
 const isSecretField = (name: string) => /pass|secret|token|key|pin|otp/i.test(name);
 
 function itemInfo(vault: Vault, ref: Ref): ItemInfo {
-  const base = `${ref.tenant}/${ref.project}/${ref.service}/${ref.key}`;
-  const info = (vault.listItems(ref.tenant, ref.project, ref.service) as unknown as ItemInfo[]).find((i) => i.ref === base);
+  const base = formatRef({ ...ref, field: undefined, version: undefined });
+  const info = (vault.listItems(ref.tenant, ref.project, serviceKey(ref.env, ref.service)) as unknown as ItemInfo[]).find(
+    (i) => i.ref === base,
+  );
   if (!info) throw new VaultError(`item ${base} not found`);
   return info;
 }
@@ -260,7 +270,7 @@ async function mainMenu(vault: Vault): Promise<void> {
     if (a === "browse") await tenantsMenu(vault);
     if (a === "table") note(itemsTable(allItems(vault), "All items"));
     if (a === "audit") note(auditTable(vault.auditLog(30) as never));
-    if (a === "export") await act(() => exportFlow(vault, []));
+    if (a === "export") await act(() => exportFlow(vault, {}));
   }
 }
 
@@ -416,17 +426,17 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
     );
     const a = await menu<string>("Pick an item", [
       ...tableSection(
-        ["SERVICE", "KEY", "TYPE", "ROLE", "DEFAULT", "FIELDS / FILE", "VER", "DESCRIPTION"],
+        ["ENV", "SERVICE", "KEY", "TYPE", "ROLE", "DEFAULT", "FIELDS / FILE", "VER", "DESCRIPTION"],
         items.map((i) => {
-          const [, , service] = i.ref.split("/");
+          const r = parseRef(i.ref);
           return {
-            cells: [service, keyOf(i.ref), i.type, i.role, i.default ? yellow("yes") : "", fieldsOrFile(i), `v${i.version}`, i.description],
+            cells: [r.env ? cyan(r.env) : "", r.service, r.key, i.type, i.role, i.default ? yellow("yes") : "", fieldsOrFile(i), `v${i.version}`, i.description],
             value: i.ref,
           };
         }),
-        { 1: 0, 5: 0, 7: 30 },
+        { 2: 0, 6: 0, 8: 30 },
         "no items yet — add one below",
-        ["DESCRIPTION", "VER", "DEFAULT", "ROLE", "SERVICE"],
+        ["DESCRIPTION", "VER", "DEFAULT", "ROLE", "TYPE"],
       ),
       section("Actions"),
       { name: "+ New item…", value: "__new" },
@@ -440,7 +450,7 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
     if (a === BACK) return;
     if (a === "__new") await act(() => newItemFlow(vault, tenant, project));
     else if (a === "__services") await servicesMenu(vault, tenant, project);
-    else if (a === "__export") await act(() => exportFlow(vault, [tenant, project]));
+    else if (a === "__export") await act(() => exportFlow(vault, { tenant, project }));
     else if (a === "__bind") await act(() => ok(`linked ${tilde(vault.bindPath(tenant, project, process.cwd()))}`));
     else if (a === "__reveal") {
       await act(() => {
@@ -458,13 +468,23 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
 
 async function servicesMenu(vault: Vault, tenant: string, project: string): Promise<void> {
   for (;;) {
-    const svcs = vault.listServices(tenant, project, true) as Array<{ service: string; url: string | null; items: number; archived_at?: string }>;
+    const svcs = vault.listServices(tenant, project, true) as unknown as Array<{
+      key: string;
+      service: string;
+      environment: string | null;
+      url: string | null;
+      items: number;
+      archived_at?: string;
+    }>;
     page(vault, ["home", tenant, project, "services"]);
     const a = await menu<string>("Pick a service", [
       ...tableSection(
-        ["SERVICE", "URL", "ITEMS", "STATUS"],
-        svcs.map((s) => ({ cells: [s.service, s.url, s.items, status(s.archived_at)], value: s.service })),
-        { 1: 50 },
+        ["ENV", "SERVICE", "URL", "ITEMS", "ALLOWED HOSTS", "STATUS"],
+        svcs.map((s) => ({
+          cells: [s.environment ? cyan(s.environment) : "", s.service, s.url, s.items, vault.allowedHosts(tenant, project, s.key).join(", "), status(s.archived_at)],
+          value: s.key,
+        })),
+        { 2: 50, 4: 60 },
       ),
       section("Actions"),
       { name: "+ New service…", value: "__new" },
@@ -475,14 +495,14 @@ async function servicesMenu(vault: Vault, tenant: string, project: string): Prom
       await act(async () => ok(`service ${await createService(vault, tenant, project)} created`));
       continue;
     }
-    const s = svcs.find((x) => x.service === a)!;
+    const s = svcs.find((x) => x.key === a)!;
     if (s.archived_at) {
-      if (await confirm({ message: `Service ${s.service} is archived. Restore it?`, default: false })) {
-        await act(() => ok(vault.restore([tenant, project, s.service], SOURCE)));
+      if (await confirm({ message: `Service ${formatServicePath(tenant, project, s.key)} is archived. Restore it?`, default: false })) {
+        await act(() => ok(vault.restore([tenant, project, s.key], SOURCE)));
       }
       continue;
     }
-    await serviceMenu(vault, tenant, project, s.service);
+    await serviceMenu(vault, tenant, project, s.key);
   }
 }
 
@@ -494,7 +514,7 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
     } catch {
       return;
     }
-    page(vault, ["home", tenant, project, service]);
+    page(vault, ["home", ...crumbsOf({ tenant, project, ...splitServiceKey(service) })]);
     const a = await menu<string>("Pick an item", [
       ...tableSection(
         ["KEY", "TYPE", "ROLE", "DEFAULT", "FIELDS / FILE", "VER", "DESCRIPTION"],
@@ -538,7 +558,7 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
       });
     }
     else if (a === "__archive") {
-      if (await confirm({ message: `Archive service ${service}?`, default: false })) {
+      if (await confirm({ message: `Archive service ${formatServicePath(tenant, project, service)}?`, default: false })) {
         await act(() => ok(vault.archive([tenant, project, service], SOURCE)));
         return;
       }
@@ -546,7 +566,7 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
       const i = items.find((x) => x.ref === a)!;
       if (i.archived_at) {
         if (await confirm({ message: `${i.ref} is archived. Restore it?`, default: false })) {
-          await act(() => ok(vault.restore(i.ref.split("/"), SOURCE)));
+          await act(() => ok(vault.restore(vault.resolveTarget(i.ref), SOURCE)));
         }
         continue;
       }
@@ -557,17 +577,26 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
 
 // ---------- create ----------
 
+/** Create a service (optionally in an environment); returns its composite key. */
 async function createService(vault: Vault, tenant: string, project: string): Promise<string> {
+  const known = vault.listEnvironments(tenant);
+  let env = await menu<string>("Environment", [
+    ...known.map((e) => ({ name: e, value: e })),
+    { name: "+ New environment…", value: "__new" },
+    { name: dim("none (no environment)"), value: "" },
+  ]);
+  if (env === "__new") env = await slugPrompt("Environment name (e.g. develop, staging, prod)");
   const slug = await slugPrompt("Service slug (e.g. postgres, stripe, admin-panel)");
   const url = await input({ message: "URL (optional)" });
-  vault.ensureService(tenant, project, slug, url ? { url } : {});
-  return slug;
+  const key = serviceKey(env || undefined, slug);
+  vault.ensureService(tenant, project, key, url ? { url } : {});
+  return key;
 }
 
 async function newItemFlow(vault: Vault, tenant: string, project: string): Promise<void> {
-  const svcs = vault.listServices(tenant, project) as Array<{ service: string; url: string | null }>;
+  const svcs = vault.listServices(tenant, project) as unknown as Array<{ key: string; service: string; environment: string | null; url: string | null }>;
   let service = await menu<string>("Which service?", [
-    ...svcs.map((s) => ({ name: `${s.service}${s.url ? dim(`  ${s.url}`) : ""}`, value: s.service })),
+    ...svcs.map((s) => ({ name: `${s.environment ? cyan(`${s.environment}/`) : ""}${s.service}${s.url ? dim(`  ${s.url}`) : ""}`, value: s.key })),
     { name: "+ New service…", value: "__new" },
   ]);
   if (service === "__new") service = await createService(vault, tenant, project);
@@ -589,7 +618,7 @@ async function askTags(vault: Vault, ref: Ref): Promise<void> {
 
 async function newCredential(vault: Vault, t: string, p: string, s: string): Promise<void> {
   const key = await keyPrompt("Name (e.g. superadmin, readonly-user)");
-  const ref: Ref = { tenant: t, project: p, service: s, key };
+  const ref: Ref = mkRef(t, p, s, key);
   const fields: Record<string, string> = {};
   const username = await input({ message: "username (optional)" });
   if (username) fields.username = username;
@@ -601,31 +630,33 @@ async function newCredential(vault: Vault, t: string, p: string, s: string): Pro
   const description = await input({ message: "Description (optional)" });
   vault.setCredential(ref, fields, description || undefined, SOURCE);
   await askTags(vault, ref);
-  ok(`stored ${t}/${p}/${s}/${key} [${Object.keys(fields).join(", ")}]`);
+  ok(`stored ${formatRef(ref)} [${Object.keys(fields).join(", ")}]`);
 }
 
 async function newSecret(vault: Vault, t: string, p: string, s: string): Promise<void> {
   const key = await keyPrompt("Name (e.g. api_key, DATABASE_URL)");
-  const ref: Ref = { tenant: t, project: p, service: s, key };
+  const ref: Ref = mkRef(t, p, s, key);
   const value = await secretPrompt("Value (hidden)");
   const description = await input({ message: "Description (optional)" });
   vault.setSecret(ref, value, description || undefined, SOURCE);
   await askTags(vault, ref);
-  ok(`stored ${t}/${p}/${s}/${key}`);
+  ok(`stored ${formatRef(ref)}`);
 }
 
 async function newFile(vault: Vault, t: string, p: string, s: string): Promise<void> {
   const key = await keyPrompt("Name (e.g. service-account, deploy-key)");
   const src = await input({ message: "Path of the file to upload", validate: (v) => existsSync(resolve(v)) || "file not found" });
   const description = await input({ message: "Description (optional)" });
-  const r = vault.putFile({ tenant: t, project: p, service: s, key }, resolve(src), description || undefined, SOURCE);
-  ok(`stored ${r.filename} (${humanSize(r.size)}) as ${t}/${p}/${s}/${key}`);
+  const ref = mkRef(t, p, s, key);
+  const r = vault.putFile(ref, resolve(src), description || undefined, SOURCE);
+  ok(`stored ${r.filename} (${humanSize(r.size)}) as ${formatRef(ref)}`);
 }
 
 // ---------- export ----------
 
-async function exportFlow(vault: Vault, scope: string[]): Promise<void> {
-  const label = scope.join("/") || "the whole vault";
+async function exportFlow(vault: Vault, scope: Scope): Promise<void> {
+  const label = formatScope(scope);
+  const tag = [scope.tenant, scope.env, scope.project].filter(Boolean).join("-") || "all";
   const format = await menu<ExportFormat>(`Export ${label} as…`, [
     { name: `Encrypted bundle ${dim("(recommended) passphrase-protected, includes files · restore with cvault import-bundle")}`, value: "bundle" },
     { name: `.env file ${dim("PLAINTEXT KEY=value — credentials become KEY_FIELD, files skipped")}`, value: "env" },
@@ -633,7 +664,7 @@ async function exportFlow(vault: Vault, scope: string[]): Promise<void> {
   ]);
   const plaintext = format !== "bundle";
   const ext = format === "bundle" ? "cvault" : format;
-  const target = resolve(await input({ message: "Save to", default: `./cvault-${scope.join("-") || "all"}.${ext}` }));
+  const target = resolve(await input({ message: "Save to", default: `./cvault-${tag}.${ext}` }));
   if (plaintext && !(await confirm({ message: yellow(`Write ${label} as PLAINTEXT? Anyone with the file can read every secret.`), default: false }))) {
     note(dim("↩ cancelled — nothing exported"));
     return;
@@ -654,7 +685,7 @@ async function exportFlow(vault: Vault, scope: string[]): Promise<void> {
   let extra = "";
   if (format === "bundle") content = encryptBundle(items, passphrase);
   else if (format === "env") {
-    const r = toEnv(items, scope.length);
+    const r = toEnv(items, scope);
     content = r.text;
     if (r.skipped.length) extra = ` · skipped ${r.skipped.length} file item(s)`;
   } else content = toJson(items);
@@ -691,7 +722,7 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
       return; // archived or gone
     }
     const key = keyOf(info.ref);
-    page(vault, ["home", ref.tenant, ref.project, ref.service, key]);
+    page(vault, ["home", ...crumbsOf(ref), key]);
     console.log(detailsTable(info));
 
     const copyOpts =
@@ -754,7 +785,7 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
       }
       else if (a === "versions") await versionsMenu(vault, ref, info);
       else if (a === "archive") {
-        if (await confirm({ message: `Archive ${info.ref}?`, default: false })) ok(vault.archive(info.ref.split("/"), SOURCE));
+        if (await confirm({ message: `Archive ${info.ref}?`, default: false })) ok(vault.archive(vault.resolveTarget(info.ref), SOURCE));
       }
     });
   }
@@ -762,7 +793,7 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
 
 function showItem(vault: Vault, ref: Ref): void {
   const item = vault.getItem(ref, SOURCE);
-  const title = `${keyOf(`${ref.tenant}/${ref.project}/${ref.service}/${ref.key}`)} (v${item.version}) ${dim("— visible until your next action")}`;
+  const title = `${ref.key} (v${item.version}) ${dim("— visible until your next action")}`;
   const rows = typeof item.value === "string" ? [["value", item.value]] : Object.entries(item.value);
   note(renderTable(["FIELD", "VALUE"], rows, { title, maxCol: 0 }));
 }
@@ -825,7 +856,7 @@ async function versionsMenu(vault: Vault, ref: Ref, info: ItemInfo): Promise<voi
       fields?: string[];
       filename?: string;
     }>;
-    page(vault, ["home", ref.tenant, ref.project, ref.service, key, "versions"]);
+    page(vault, ["home", ...crumbsOf(ref), key, "versions"]);
     const v = await menu<number | string>("Pick a version", [
       ...tableSection(
         ["VERSION", "CURRENT", "CREATED (UTC)", "SOURCE", "FIELDS / FILE"],
@@ -844,7 +875,7 @@ async function versionsMenu(vault: Vault, ref: Ref, info: ItemInfo): Promise<voi
     const version = v as number;
     const vref: Ref = { ...ref, version };
     const fields = versions.find((x) => x.version === version)?.fields;
-    page(vault, ["home", ref.tenant, ref.project, ref.service, key, `v${version}`]);
+    page(vault, ["home", ...crumbsOf(ref), key, `v${version}`]);
     const a = await menu<string>(`${bold(`v${version}`)} of ${key} — choose an action`, [
       section("Copy to clipboard"),
       ...(info.type === "credential" && fields

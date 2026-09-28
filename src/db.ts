@@ -86,6 +86,8 @@ function migrate(db: Database.Database): void {
   // v3: enforced policies
   addColumn(db, "services", "allowed_hosts", "allowed_hosts TEXT NOT NULL DEFAULT '[]'");
   addColumn(db, "projects", "allow_chat_values", "allow_chat_values INTEGER NOT NULL DEFAULT 0");
+  // v4: environments — services are keyed "env/service"; directory links may carry an environment
+  addColumn(db, "projects", "bound_envs", "bound_envs TEXT NOT NULL DEFAULT '{}'");
   db.exec(`
     CREATE TABLE IF NOT EXISTS item_versions (
       id         INTEGER PRIMARY KEY,

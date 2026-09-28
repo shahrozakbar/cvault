@@ -7,7 +7,7 @@ import {
   USE_BUDGET,
   USE_WINDOW_MIN,
 } from "./policy.js";
-import { formatRef, parseRef, type ProjectCtx, type Ref, type Vault, VaultError } from "./store.js";
+import { formatRef, formatServicePath, parseRef, type ProjectCtx, type Ref, serviceKey, type Vault, VaultError } from "./store.js";
 
 /**
  * Server-side enforcement that runs before any tool uses secrets. Unlike instructions to the model,
@@ -123,10 +123,11 @@ export async function prepareUse(
 export function checkHosts(vault: Vault, refs: Ref[], targetHosts: string[]): void {
   const seen = new Set<string>();
   for (const ref of refs) {
-    const svc = `${ref.tenant}/${ref.project}/${ref.service}`;
+    const key = serviceKey(ref.env, ref.service);
+    const svc = formatServicePath(ref.tenant, ref.project, key);
     if (seen.has(svc)) continue;
     seen.add(svc);
-    const allowed = vault.allowedHosts(ref.tenant, ref.project, ref.service);
+    const allowed = vault.allowedHosts(ref.tenant, ref.project, key);
     if (!allowed.length) continue;
     const offending = targetHosts.filter((h) => !hostAllowed(h, allowed));
     if (offending.length) {

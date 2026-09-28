@@ -8,7 +8,7 @@ import { httpRequest, materializeFile, PLACEHOLDER, runWithSecrets, writeEnvFile
 import { extractHosts } from "./policy.js";
 import { passwordFromEnv } from "./password.js";
 import { requestCredential, sealedFetch, sealedSave } from "./sealed.js";
-import { formatRef, parseRef, parseScope, parseTarget, type ProjectCtx, type Ref, Vault, VaultError } from "./store.js";
+import { formatRef, formatScope, formatServicePath, parseRef, parseScope, parseServicePath, type ProjectCtx, type Ref, Vault, VaultError } from "./store.js";
 
 let vault: Vault | null = null;
 let lockReason = "vault locked";
@@ -36,7 +36,7 @@ const server = new McpServer(
   {
     instructions: [
       "Local password manager. Hierarchy: tenant → project → service → item (secret | credential | file).",
-      "Refs look like tenant/project/service/key, optionally #field for credentials (default field: password) and @N for an old version (e.g. key@2#username).",
+      "Refs look like tenant/env/project/service/key (environment such as develop, staging, prod) or tenant/project/service/key (no environment), optionally #field (default field: password) and @N for an old version. Inside a linked project: env/service/key or service/key.",
       "Credentials may carry a role label and one per service may be the default: when the user names a role (\"login as admin\") use the item with that role; if no role is named use the service's default; only ask when several match and none is default.",
       "Nothing is ever deleted: use archive/restore. Every update creates a new version; see list_versions / rollback_secret.",
       "If a project is bound to the working directory, short refs service/key work too — call resolve_context first.",
@@ -134,16 +134,18 @@ tool(
 
 tool(
   "list_items",
-  "List item metadata (never values, includes current version) in a project or a single service. `scope` is tenant/project or tenant/project/service; omit to use cwd's project.",
+  "List item metadata (never values, includes current version and environment). `scope`: tenant | tenant/env | tenant/project | tenant/[env/]project[/service]; omit for the project linked to cwd (all environments).",
   { scope: z.string().optional(), include_archived: archivedArg, cwd: cwdArg },
   ({ scope, include_archived, cwd }) => {
     if (!scope) {
       const [t, p] = projectOf(undefined, cwd);
       return v().listItems(t, p, undefined, include_archived);
     }
-    const parts = parseScope(scope);
-    if (parts.length < 2) throw new VaultError("scope must be tenant/project[/service]");
-    return v().listItems(parts[0], parts[1], parts[2], include_archived);
+    const sc = v().resolveScope(scope);
+    const projects = (v().listProjects(sc.tenant) as unknown as Array<{ tenant: string; project: string }>).filter(
+      (pr) => !sc.project || pr.project === sc.project,
+    );
+    return projects.flatMap((pr) => v().listItems(pr.tenant, pr.project, sc.service, include_archived, sc.env));
   },
 );
 
@@ -179,32 +181,36 @@ tool(
 
 tool(
   "create_service",
-  "Create or update a service (e.g. postgres, stripe, aws) under a project.",
+  "Create or update a service (e.g. postgres, stripe, aws) under a project, optionally in an environment.",
   {
-    service: z.string().describe("tenant/project/service"),
+    service: z.string().describe("tenant/project/service or tenant/env/project/service"),
     name: z.string().optional(),
     url: z.string().optional(),
     notes: z.string().optional(),
   },
   ({ service, ...info }) => {
-    const parts = parseScope(service);
-    if (parts.length !== 3) throw new VaultError("service must be tenant/project/service");
-    v().ensureService(parts[0], parts[1], parts[2], info);
-    return `service ${service} ready`;
+    const [t, p, key] = parseServicePath(service);
+    v().ensureService(t, p, key, info);
+    return `service ${formatServicePath(t, p, key)} ready`;
   },
 );
 
 tool(
   "bind_project_path",
-  "Bind (or unbind) a local directory to a project so short refs resolve automatically inside it.",
-  { project: z.string().describe("tenant/project"), path: z.string(), unbind: z.boolean().default(false) },
-  ({ project, path, unbind }) => {
+  "Bind (or unbind) a local directory to a project so short refs resolve automatically inside it. Optional env = default environment for 2-part short refs (service/key).",
+  {
+    project: z.string().describe("tenant/project"),
+    path: z.string(),
+    env: z.string().optional().describe("default environment for this directory, e.g. staging"),
+    unbind: z.boolean().default(false),
+  },
+  ({ project, path, env, unbind }) => {
     const [t, p] = projectOf(project);
     if (unbind) {
       v().unbindPath(t, p, path);
       return `unbound ${resolve(path)}`;
     }
-    return `bound ${v().bindPath(t, p, path)} → ${t}/${p}`;
+    return `bound ${v().bindPath(t, p, path, env)} → ${t}/${p}${env ? ` (environment ${env})` : ""}`;
   },
 );
 
@@ -285,14 +291,14 @@ tool(
   "archive",
   "Archive (never delete) a tenant, project, service or item: tenant | tenant/project | tenant/project/service | tenant/project/service/key. Archived things are hidden and unusable until restored.",
   { target: z.string() },
-  ({ target }) => v().archive(parseTarget(target)),
+  ({ target }) => v().archive(v().resolveTarget(target)),
 );
 
 tool(
   "restore",
   "Restore an archived tenant, project, service or item.",
   { target: z.string() },
-  ({ target }) => v().restore(parseTarget(target)),
+  ({ target }) => v().restore(v().resolveTarget(target)),
 );
 
 tool(

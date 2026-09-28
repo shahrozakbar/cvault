@@ -5,23 +5,27 @@ import { parseRef } from "../src/store.js";
 const ctx = { tenant: "rezilens", project: "digrc-api-service" };
 
 describe("suggestPath (dialog path correction)", () => {
-  it("folds extra levels into the service name", () => {
+  it("turns project-before-environment into tenant/env/project/service/key", () => {
     const s = suggestPath("rezilens/digrc-api-service/develop/admin-panel/systemadmin", ctx);
-    expect(s).toBe("rezilens/digrc-api-service/develop-admin-panel/systemadmin");
-    expect(() => parseRef(s!, ctx)).not.toThrow();
+    expect(s).toBe("rezilens/develop/digrc-api-service/admin-panel/systemadmin");
+    expect(parseRef(s!, ctx)).toMatchObject({ env: "develop", project: "digrc-api-service", service: "admin-panel" });
   });
 
-  it("recognises the linked tenant/project anywhere in the path", () => {
-    expect(suggestPath("rezilens/develop/digrc-api-service/admin-panel/systemadmin", ctx)).toBe(
-      "rezilens/digrc-api-service/develop-admin-panel/systemadmin",
-    );
+  it("keeps a correct 5-level path as-is", () => {
+    expect(suggestPath("rezilens/develop/digrc-api-service/admin-panel/systemadmin", ctx)).toBeNull();
+  });
+
+  it("recognises the linked tenant/project anywhere and folds extra levels into the service", () => {
     expect(suggestPath("develop/digrc-api-service/admin-panel/systemadmin", ctx)).toBe(
-      "rezilens/digrc-api-service/develop-admin-panel/systemadmin",
+      "rezilens/develop/digrc-api-service/admin-panel/systemadmin",
+    );
+    expect(suggestPath("rezilens/digrc-api-service/staging/admin/panel/root", ctx)).toBe(
+      "rezilens/staging/digrc-api-service/admin-panel/root",
     );
   });
 
-  it("adds the linked project to a 3-level path", () => {
-    expect(suggestPath("develop/admin-panel/systemadmin", ctx)).toBe("rezilens/digrc-api-service/develop-admin-panel/systemadmin");
+  it("adds the linked project to short paths", () => {
+    expect(suggestPath("Staging/Admin Panel/root", ctx)).toBe("rezilens/staging/digrc-api-service/admin-panel/root");
     expect(suggestPath("develop/admin-panel/systemadmin", null)).toBeNull();
   });
 

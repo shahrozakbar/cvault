@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseRef, parseTarget, Vault } from "../src/store.js";
+import { parseRef, Vault } from "../src/store.js";
 
 const FAST_KDF = { N: 2 ** 10, r: 8, p: 1 };
 let home: string;
@@ -83,11 +83,11 @@ describe("versioning", () => {
 describe("archive", () => {
   it("archives and restores items without losing data", () => {
     vault.setSecret(R("a/p/s/k"), "keep-me");
-    expect(vault.archive(parseTarget("a/p/s/k"))).toBe("archived a/p/s/k");
+    expect(vault.archive(vault.resolveTarget("a/p/s/k"))).toBe("archived a/p/s/k");
     expect(vault.listItems("a", "p")).toHaveLength(0);
     expect(vault.listItems("a", "p", undefined, true)[0]).toHaveProperty("archived_at");
     expect(() => vault.resolveValue(R("a/p/s/k"))).toThrow(/archived/);
-    vault.restore(parseTarget("a/p/s/k"));
+    vault.restore(vault.resolveTarget("a/p/s/k"));
     expect(vault.resolveValue(R("a/p/s/k"))).toBe("keep-me");
   });
 
@@ -117,7 +117,7 @@ describe("archive", () => {
 
   it("writing to an archived item restores it as a new version", () => {
     vault.setSecret(R("a/p/s/k"), "v1");
-    vault.archive(parseTarget("a/p/s/k"));
+    vault.archive(vault.resolveTarget("a/p/s/k"));
     expect(vault.setSecret(R("a/p/s/k"), "v2")).toBe(2);
     expect(vault.resolveValue(R("a/p/s/k@1"))).toBe("v1");
   });

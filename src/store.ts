@@ -7,9 +7,14 @@ import { openDb, vaultHome } from "./db.js";
 
 export type ItemType = "secret" | "credential" | "file";
 
-/** Fully-qualified pointer to an item: tenant/project/service/key[@version][#field]. */
+/**
+ * Fully-qualified pointer to an item:
+ *   tenant/[env/]project/service/key[@version][#field]
+ * The environment (develop, staging, …) is optional; without it the item has no environment.
+ */
 export interface Ref {
   tenant: string;
+  env?: string;
   project: string;
   service: string;
   key: string;
@@ -20,6 +25,36 @@ export interface Ref {
 export interface ProjectCtx {
   tenant: string;
   project: string;
+  /** environment linked to the directory (used by 2-part short refs) */
+  env?: string;
+}
+
+/**
+ * Services are stored per environment under a composite key "env/service" (or just "service"),
+ * so the unique constraint, allowed hosts, locks and versions all apply per environment.
+ */
+export function serviceKey(env: string | undefined, service: string): string {
+  return env ? `${env}/${service}` : service;
+}
+
+export function splitServiceKey(key: string): { env?: string; service: string } {
+  const i = key.indexOf("/");
+  return i < 0 ? { service: key } : { env: key.slice(0, i), service: key.slice(i + 1) };
+}
+
+/** Human path of a service: tenant/[env/]project/service. */
+export function formatServicePath(tenant: string, project: string, key: string): string {
+  const { env, service } = splitServiceKey(key);
+  return env ? `${tenant}/${env}/${project}/${service}` : `${tenant}/${project}/${service}`;
+}
+
+/** "tenant/project/service" or "tenant/env/project/service" → [tenant, project, serviceKey]. */
+export function parseServicePath(input: string): [string, string, string] {
+  const parts = input.split("/").filter(Boolean);
+  parts.forEach((p) => checkSlug("segment", p));
+  if (parts.length === 3) return [parts[0], parts[1], parts[2]];
+  if (parts.length === 4) return [parts[0], parts[2], serviceKey(parts[1], parts[3])];
+  throw new VaultError(`invalid service path "${input}" (expected tenant/[env/]project/service)`);
 }
 
 export class VaultError extends Error {}
@@ -45,12 +80,23 @@ function checkSlug(kind: string, s: string): string {
 }
 
 export function formatRef(r: Ref): string {
-  return `${r.tenant}/${r.project}/${r.service}/${r.key}${r.version ? `@${r.version}` : ""}${r.field ? `#${r.field}` : ""}`;
+  const head = r.env ? `${r.tenant}/${r.env}/${r.project}` : `${r.tenant}/${r.project}`;
+  return `${head}/${r.service}/${r.key}${r.version ? `@${r.version}` : ""}${r.field ? `#${r.field}` : ""}`;
+}
+
+/** Ref relative to a linked project: "[env/]service/key". */
+export function shortRef(r: Ref): string {
+  return `${r.env ? `${r.env}/` : ""}${r.service}/${r.key}`;
 }
 
 /**
- * Parse "tenant/project/service/key[@version][#field]". When a project context is known (e.g. from
- * the current directory), the short form "service/key[@version][#field]" is also accepted.
+ * Parse a ref:
+ *   tenant/env/project/service/key   (5 levels, with environment)
+ *   tenant/project/service/key       (4 levels, no environment)
+ * Inside a linked project (ctx) also:
+ *   env/service/key                  (3 levels)
+ *   service/key                      (2 levels; environment of the directory link, if any)
+ * Each form may end in @version and/or #field.
  */
 export function parseRef(input: string, ctx?: ProjectCtx | null): Ref {
   const [pathPart, field] = input.trim().split("#", 2);
@@ -64,16 +110,23 @@ export function parseRef(input: string, ctx?: ProjectCtx | null): Ref {
   }
   const parts = path.split("/").filter(Boolean);
   let ref: Ref;
-  if (parts.length === 4) {
+  if (parts.length === 5) {
+    ref = { tenant: parts[0], env: parts[1], project: parts[2], service: parts[3], key: parts[4] };
+  } else if (parts.length === 4) {
     ref = { tenant: parts[0], project: parts[1], service: parts[2], key: parts[3] };
-  } else if (parts.length === 2 && ctx) {
-    ref = { tenant: ctx.tenant, project: ctx.project, service: parts[0], key: parts[1] };
-  } else if (parts.length === 2) {
-    throw new VaultError(`"${input}" is a short ref but no project is bound to the current directory; use tenant/project/service/key`);
+  } else if ((parts.length === 3 || parts.length === 2) && ctx) {
+    const env = parts.length === 3 ? parts[0] : ctx.env;
+    ref = { tenant: ctx.tenant, project: ctx.project, service: parts[parts.length - 2], key: parts[parts.length - 1] };
+    if (env) ref.env = env;
+  } else if (parts.length === 2 || parts.length === 3) {
+    throw new VaultError(
+      `"${input}" is a short ref but no project is linked to the current directory; use tenant/[env/]project/service/key`,
+    );
   } else {
-    throw new VaultError(`invalid ref "${input}" (expected tenant/project/service/key[@version][#field])`);
+    throw new VaultError(`invalid ref "${input}" (expected tenant/[env/]project/service/key[@version][#field])`);
   }
   checkSlug("tenant", ref.tenant);
+  if (ref.env) checkSlug("environment", ref.env);
   checkSlug("project", ref.project);
   checkSlug("service", ref.service);
   if (!KEY.test(ref.key)) throw new VaultError(`invalid key "${ref.key}"`);
@@ -90,15 +143,19 @@ export function parseScope(input: string): string[] {
   return parts;
 }
 
-/** Parse an archive/restore target: tenant, tenant/project, tenant/project/service or a full item ref. */
-export function parseTarget(input: string): string[] {
-  const parts = input.split("/").filter(Boolean);
-  if (parts.length === 4) {
-    const r = parseRef(input);
-    if (r.version || r.field) throw new VaultError("archive/restore targets cannot have @version or #field");
-    return [r.tenant, r.project, r.service, r.key];
-  }
-  return parseScope(input);
+/** A listing/export scope: everything, a tenant, an environment, a project or one service. */
+export interface Scope {
+  tenant?: string;
+  env?: string;
+  project?: string;
+  /** composite service key ("env/service" or "service") */
+  service?: string;
+}
+
+export function formatScope(s: Scope): string {
+  if (!s.tenant) return "the whole vault";
+  if (s.service && s.project) return formatServicePath(s.tenant, s.project, s.service);
+  return [s.tenant, s.env, s.project].filter(Boolean).join("/");
 }
 
 interface ItemRow {
@@ -241,13 +298,16 @@ export class Vault {
     return row.id;
   }
 
+  /** `service` is the composite key ("env/service" or "service"). */
   ensureService(
     tenant: string,
     project: string,
     service: string,
     info: { name?: string; url?: string; notes?: string } = {},
   ): number {
-    checkSlug("service", service);
+    const parts = splitServiceKey(service);
+    if (parts.env) checkSlug("environment", parts.env);
+    checkSlug("service", parts.service);
     const pid = this.ensureProject(tenant, project);
     this.db
       .prepare("INSERT INTO services (project_id, slug) VALUES (?, ?) ON CONFLICT(project_id, slug) DO NOTHING")
@@ -256,7 +316,7 @@ export class Vault {
       id: number;
       archived_at: string | null;
     };
-    if (row.archived_at) throw new VaultError(`service "${tenant}/${project}/${service}" is archived — restore it first`);
+    if (row.archived_at) throw new VaultError(`service "${formatServicePath(tenant, project, service)}" is archived — restore it first`);
     for (const col of ["name", "url", "notes"] as const) {
       if (info[col] !== undefined) this.db.prepare(`UPDATE services SET ${col} = ? WHERE id = ?`).run(info[col], row.id);
     }
@@ -283,8 +343,8 @@ export class Vault {
     const row = this.db.prepare("SELECT id, archived_at FROM services WHERE project_id = ? AND slug = ?").get(pid, service) as
       | { id: number; archived_at: string | null }
       | undefined;
-    if (!row) throw new VaultError(`service "${tenant}/${project}/${service}" not found`);
-    if (row.archived_at) throw new VaultError(`service "${tenant}/${project}/${service}" is archived — restore it first`);
+    if (!row) throw new VaultError(`service "${formatServicePath(tenant, project, service)}" not found`);
+    if (row.archived_at) throw new VaultError(`service "${formatServicePath(tenant, project, service)}" is archived — restore it first`);
     return row.id;
   }
 
@@ -302,7 +362,7 @@ export class Vault {
   listProjects(tenant?: string, includeArchived = false) {
     const rows = this.db
       .prepare(
-        `SELECT t.slug AS tenant, p.slug AS project, p.name, p.allow_reveal, p.bound_paths,
+        `SELECT t.slug AS tenant, p.slug AS project, p.name, p.allow_reveal, p.bound_paths, p.bound_envs,
                 COALESCE(t.archived_at, p.archived_at) AS archived_at,
                 (SELECT COUNT(*) FROM services s WHERE s.project_id = p.id AND (? OR s.archived_at IS NULL)) AS services
          FROM projects p JOIN tenants t ON t.id = p.tenant_id
@@ -315,6 +375,7 @@ export class Vault {
         ...r,
         allow_reveal: !!r.allow_reveal,
         bound_paths: JSON.parse(r.bound_paths as string),
+        bound_envs: JSON.parse((r.bound_envs as string) ?? "{}"),
       }),
     );
   }
@@ -328,11 +389,26 @@ export class Vault {
          FROM services s WHERE s.project_id = ? AND (? OR s.archived_at IS NULL) ORDER BY s.slug`,
       )
       .all(includeArchived ? 1 : 0, pid, includeArchived ? 1 : 0)
-      .map((r) => dropNullArchived(r as Record<string, unknown>));
+      .map((r) => {
+        const row = r as Record<string, unknown>;
+        const { env, service } = splitServiceKey(row.service as string);
+        return dropNullArchived({ ...row, key: row.service, environment: env ?? null, service });
+      });
   }
 
-  /** Metadata only — never values. */
-  listItems(tenant: string, project: string, service?: string, includeArchived = false) {
+  /** Distinct environments used by a tenant (or all tenants). */
+  listEnvironments(tenant?: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT s.slug FROM services s JOIN projects p ON p.id = s.project_id JOIN tenants t ON t.id = p.tenant_id
+         WHERE (? IS NULL OR t.slug = ?) AND s.archived_at IS NULL AND p.archived_at IS NULL AND t.archived_at IS NULL`,
+      )
+      .all(tenant ?? null, tenant ?? null) as Array<{ slug: string }>;
+    return [...new Set(rows.map((r) => splitServiceKey(r.slug).env).filter((e): e is string => !!e))].sort();
+  }
+
+  /** Metadata only — never values. `service` = composite key; `env` filters one environment ("" = none). */
+  listItems(tenant: string, project: string, service?: string, includeArchived = false, env?: string) {
     const pid = this.projectRow(tenant, project).id;
     const rows = this.db
       .prepare(
@@ -352,9 +428,16 @@ export class Vault {
       updated_at: string;
       archived_at: string | null;
     }>;
-    return rows.map((r) =>
+    return rows
+      .filter((r) => env === undefined || (splitServiceKey(r.service).env ?? "") === env)
+      .map((r) => {
+        const sk = splitServiceKey(r.service);
+        return { r, sk };
+      })
+      .map(({ r, sk }) =>
       dropNullArchived({
-        ref: `${tenant}/${project}/${r.service}/${r.key}`,
+        ref: formatRef({ tenant, env: sk.env, project, service: sk.service, key: r.key }),
+        environment: sk.env ?? null,
         type: r.type,
         ...JSON.parse(r.meta),
         version: r.version,
@@ -383,10 +466,104 @@ export class Vault {
     return { table, ...row };
   }
 
+  /**
+   * Resolve a human path to a target array [tenant, project?, serviceKey?, key?]:
+   *   tenant | tenant/project | tenant/[env/]project/service | tenant/[env/]project/service/key
+   * The 4-part form is ambiguous (item without env vs service with env) and is resolved by lookup.
+   */
+  resolveTarget(input: string): string[] {
+    const clean = input.trim().replace(/[@#].*$/, "");
+    const parts = clean.split("/").filter(Boolean);
+    parts.forEach((p, i) => (i === parts.length - 1 && parts.length >= 4 ? KEY.test(p) : checkSlug("segment", p)));
+    const exists = (t: string[]) => {
+      try {
+        this.targetRow(t);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    switch (parts.length) {
+      case 1:
+      case 2:
+        return parts;
+      case 3:
+        return parts;
+      case 4: {
+        const item = [parts[0], parts[1], parts[2], parts[3]];
+        const envService = [parts[0], parts[2], serviceKey(parts[1], parts[3])];
+        if (exists(item)) return item;
+        if (exists(envService)) return envService;
+        throw new VaultError(`"${input}" not found`);
+      }
+      case 5:
+        return [parts[0], parts[2], serviceKey(parts[1], parts[3]), parts[4]];
+      default:
+        throw new VaultError(`invalid path "${input}"`);
+    }
+  }
+
+  /**
+   * Resolve a listing/export scope: tenant | tenant/project | tenant/env | tenant/project/service |
+   * tenant/env/project | tenant/env/project/service. Ambiguities are resolved by lookup.
+   */
+  resolveScope(input?: string): Scope {
+    if (!input) return {};
+    const parts = input.split("/").filter(Boolean);
+    parts.forEach((p) => checkSlug("segment", p));
+    const [t, a, b, c] = parts;
+    const projectExists = (proj: string) => {
+      try {
+        this.projectRow(t, proj);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    switch (parts.length) {
+      case 1:
+        return { tenant: t };
+      case 2:
+        return projectExists(a) ? { tenant: t, project: a } : { tenant: t, env: a };
+      case 3:
+        return projectExists(a) ? { tenant: t, project: a, service: b } : { tenant: t, env: a, project: b };
+      case 4:
+        return { tenant: t, env: a, project: b, service: serviceKey(a, c) };
+      default:
+        throw new VaultError(`invalid scope "${input}"`);
+    }
+  }
+
+  /** Human name of a target array. */
+  private targetName(target: string[]): string {
+    const [t, p, s, k] = target;
+    if (target.length <= 2) return target.join("/");
+    if (target.length === 3) return formatServicePath(t, p, s);
+    const sk = splitServiceKey(s);
+    return formatRef({ tenant: t, env: sk.env, project: p, service: sk.service, key: k });
+  }
+
+  /** Rename a service and/or move it into (or out of) an environment. Items, versions, hosts move with it. */
+  moveService(tenant: string, project: string, fromKey: string, toKey: string, source = "cli"): string {
+    const sid = this.serviceId(tenant, project, fromKey);
+    const pid = this.projectRow(tenant, project).id;
+    const to = splitServiceKey(toKey);
+    if (to.env) checkSlug("environment", to.env);
+    checkSlug("service", to.service);
+    if (this.db.prepare("SELECT 1 FROM services WHERE project_id = ? AND slug = ?").get(pid, toKey)) {
+      throw new VaultError(`${formatServicePath(tenant, project, toKey)} already exists`);
+    }
+    this.db.prepare("UPDATE services SET slug = ? WHERE id = ?").run(toKey, sid);
+    const from = formatServicePath(tenant, project, fromKey);
+    const dest = formatServicePath(tenant, project, toKey);
+    this.audit(source, dest, `moved from ${from}`);
+    return `moved ${from} → ${dest}`;
+  }
+
   /** Archive a tenant, project, service or item. Everything below it becomes hidden and unusable. */
   archive(target: string[], source = "mcp"): string {
     const row = this.targetRow(target);
-    const name = target.join("/");
+    const name = this.targetName(target);
     if (row.archived_at) return `${name} was already archived at ${row.archived_at}`;
     this.db.prepare(`UPDATE ${row.table} SET archived_at = datetime('now') WHERE id = ?`).run(row.id);
     this.audit(source, name, `archive-${row.table.slice(0, -1)}`);
@@ -395,14 +572,14 @@ export class Vault {
 
   restore(target: string[], source = "mcp"): string {
     const row = this.targetRow(target);
-    const name = target.join("/");
+    const name = this.targetName(target);
     if (!row.archived_at) return `${name} is not archived`;
     this.db.prepare(`UPDATE ${row.table} SET archived_at = NULL WHERE id = ?`).run(row.id);
     this.audit(source, name, `restore-${row.table.slice(0, -1)}`);
     // a restored child is still hidden if a parent is archived — tell the caller
     for (let n = target.length - 1; n >= 1; n--) {
       const parent = this.targetRow(target.slice(0, n));
-      if (parent.archived_at) return `restored ${name}, but parent ${target.slice(0, n).join("/")} is still archived`;
+      if (parent.archived_at) return `restored ${name}, but parent ${this.targetName(target.slice(0, n))} is still archived`;
     }
     return `restored ${name}`;
   }
@@ -419,30 +596,51 @@ export class Vault {
     return !!this.projectRow(tenant, project).allow_reveal;
   }
 
-  bindPath(tenant: string, project: string, dir: string): string {
+  /** Link a directory to a project, optionally with a default environment for short refs. */
+  bindPath(tenant: string, project: string, dir: string, env?: string): string {
     const abs = canonical(dir);
     const row = this.projectRow(tenant, project);
     const paths = new Set<string>(JSON.parse(row.bound_paths));
     paths.add(abs);
-    this.db.prepare("UPDATE projects SET bound_paths = ? WHERE id = ?").run(JSON.stringify([...paths]), row.id);
+    const envs = this.boundEnvs(row.id);
+    if (env) envs[abs] = checkSlug("environment", env);
+    else delete envs[abs];
+    this.db
+      .prepare("UPDATE projects SET bound_paths = ?, bound_envs = ? WHERE id = ?")
+      .run(JSON.stringify([...paths]), JSON.stringify(envs), row.id);
     return abs;
+  }
+
+  private boundEnvs(projectId: number): Record<string, string> {
+    const r = this.db.prepare("SELECT bound_envs FROM projects WHERE id = ?").get(projectId) as { bound_envs: string | null };
+    return JSON.parse(r?.bound_envs ?? "{}");
   }
 
   unbindPath(tenant: string, project: string, dir: string): void {
     const abs = canonical(dir);
     const row = this.projectRow(tenant, project);
     const paths = (JSON.parse(row.bound_paths) as string[]).filter((p) => p !== abs);
-    this.db.prepare("UPDATE projects SET bound_paths = ? WHERE id = ?").run(JSON.stringify(paths), row.id);
+    const envs = this.boundEnvs(row.id);
+    delete envs[abs];
+    this.db
+      .prepare("UPDATE projects SET bound_paths = ?, bound_envs = ? WHERE id = ?")
+      .run(JSON.stringify(paths), JSON.stringify(envs), row.id);
   }
 
   /** Find the (non-archived) project bound to `cwd` or its nearest bound ancestor. */
   resolveContext(cwd: string): (ProjectCtx & { bound_path: string }) | null {
     const abs = canonical(cwd);
     let best: (ProjectCtx & { bound_path: string }) | null = null;
-    for (const p of this.listProjects() as unknown as Array<{ tenant: string; project: string; bound_paths: string[] }>) {
+    for (const p of this.listProjects() as unknown as Array<{
+      tenant: string;
+      project: string;
+      bound_paths: string[];
+      bound_envs: Record<string, string>;
+    }>) {
       for (const bp of p.bound_paths) {
         if ((abs === bp || abs.startsWith(bp + sep)) && (!best || bp.length > best.bound_path.length)) {
           best = { tenant: p.tenant, project: p.project, bound_path: bp };
+          if (p.bound_envs?.[bp]) best.env = p.bound_envs[bp];
         }
       }
     }
@@ -452,7 +650,7 @@ export class Vault {
   // ---------- items (versioned) ----------
 
   private itemRow(ref: Ref): ItemRow {
-    const sid = this.serviceId(ref.tenant, ref.project, ref.service);
+    const sid = this.serviceId(ref.tenant, ref.project, serviceKey(ref.env, ref.service));
     const row = this.db.prepare("SELECT * FROM items WHERE service_id = ? AND key = ?").get(sid, ref.key) as ItemRow | undefined;
     const name = formatRef({ ...ref, field: undefined, version: undefined });
     if (!row) throw new VaultError(`item "${name}" not found`);
@@ -464,7 +662,7 @@ export class Vault {
   private uidFor(ref: Ref): string {
     let sid: number;
     try {
-      sid = this.serviceId(ref.tenant, ref.project, ref.service);
+      sid = this.serviceId(ref.tenant, ref.project, serviceKey(ref.env, ref.service));
     } catch {
       return randomUUID();
     }
@@ -491,7 +689,7 @@ export class Vault {
     blob?: Buffer,
   ): number {
     if (ref.version) throw new VaultError("cannot write to a specific @version; writes always create a new version");
-    const sid = this.ensureService(ref.tenant, ref.project, ref.service);
+    const sid = this.ensureService(ref.tenant, ref.project, serviceKey(ref.env, ref.service));
     const existing = this.db.prepare("SELECT * FROM items WHERE service_id = ? AND key = ?").get(sid, ref.key) as ItemRow | undefined;
 
     if (!existing) {
@@ -805,7 +1003,7 @@ export class Vault {
     const sid = this.serviceId(tenant, project, service);
     const clean = [...new Set(hosts.map((h) => h.trim().toLowerCase()).filter(Boolean))];
     this.db.prepare("UPDATE services SET allowed_hosts = ? WHERE id = ?").run(JSON.stringify(clean), sid);
-    this.audit(source, `${tenant}/${project}/${service}`, `allowed-hosts=${clean.join(",") || "(any)"}`);
+    this.audit(source, formatServicePath(tenant, project, service), `allowed-hosts=${clean.join(",") || "(any)"}`);
     return clean;
   }
 

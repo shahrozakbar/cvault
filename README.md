@@ -4,11 +4,14 @@
 
 ```
 tenant (client / workspace)
- └─ project                     ← linked to a directory on disk
-     └─ service                 (postgres, stripe, admin-panel, …)
-         └─ item                secret · credential (multi-field) · file
+ └─ environment (optional)      develop · staging · prod …
+     └─ project                 ← linked to a directory on disk
+         └─ service             (postgres, stripe, admin-panel, …)
+             └─ item            secret · credential (multi-field) · file
                                  ├─ role + default   ("log in as admin")
                                  └─ versions v1, v2, … (never deleted)
+
+path: tenant/env/project/service/key     e.g. rezilens/staging/digrc-api/admin-panel/systemadmin
 ```
 
 <table>
@@ -40,7 +43,7 @@ tenant (client / workspace)
 - [Interactive explorer](#interactive-explorer)
 - [CLI reference](#cli-reference)
 - [MCP tools](#mcp-tools)
-- [Concepts](#concepts): refs · roles & defaults · versioning · archive · export & import · directory linking
+- [Concepts](#concepts): refs & environments · roles & defaults · versioning · archive · export & import · directory linking
 - [Security model](#security-model)
 - [Development](#development)
 
@@ -70,7 +73,7 @@ claude mcp add cvault -s user \
 
 # 4. add your first project, linked to its directory
 cvault project add acme/api --bind ~/work/acme-api
-cvault set-cred acme/api/admin-panel/superadmin -u root --role admin --default   # password prompted, hidden
+cvault set-cred acme/staging/api/admin-panel/superadmin -u root --role admin --default   # password prompted, hidden
 ```
 
 > The vault lives in `~/.vault-mcp/` (override with `VAULT_HOME`). The master password never leaves the Keychain.
@@ -141,11 +144,12 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 |---|---|
 | `cvault` / `cvault ui` | interactive explorer |
 | `cvault init` | create the vault |
-| `cvault ls [scope] [--archived] [--json]` | tables of projects, services and **all items** |
+| `cvault ls [scope] [--archived] [--json]` | tables of projects, services and **all items** (scope: `t`, `t/env`, `t/p`, `t/env/p`, …) |
 | `cvault project add <t/p> [--bind dir]` | create a project, optionally linked to a directory |
-| `cvault project bind <t/p> [dir] [--remove]` | link or unlink a directory |
+| `cvault project bind <t/p> [dir] [--env e] [--remove]` | link or unlink a directory (optionally with a default environment) |
 | `cvault project reveal <t/p> on\|off` | allow Claude to read plaintext (`reveal_secret`) |
-| `cvault service <t/p/s> [--url] [--allow-host h…] [--add-host h…] [--clear-hosts]` | create or update a service, and restrict where its secrets may be sent |
+| `cvault service <t/[env/]p/s> [--url] [--allow-host h…] [--add-host h…] [--clear-hosts]` | create or update a service, and restrict where its secrets may be sent |
+| `cvault service-move <from> <to>` | rename a service or move it into or out of an environment |
 | `cvault unlock <ref>` | unlock a credential locked after a 401 or a blocked use |
 | `cvault project chat-values <t/p> on\|off` | allow Claude to store values it received in chat (off by default) |
 | `cvault set <ref> [--stdin] [-r role] [--default]` | store a secret (hidden prompt) |
@@ -179,12 +183,24 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 
 ## Concepts
 
-### Refs
-`tenant/project/service/key[@version][#field]`. For example `acme/api/postgres/app#username` or `acme/api/stripe/api_key@2`. Inside a linked directory, the short form `service/key` works too. Credentials default to the `password` field.
+### Refs & environments
+`tenant/[env/]project/service/key[@version][#field]`
+
+| Form | Example |
+|---|---|
+| with environment (5 levels) | `acme/staging/api/admin-panel/root#password` |
+| without environment (4 levels) | `acme/api/stripe/api_key@2` |
+| inside a linked directory | `staging/admin-panel/root` or `stripe/api_key` |
+
+- The environment is optional. The same service name can exist once per environment (`staging/admin-panel`, `develop/admin-panel`), each with its own items, versions and **allowed hosts**.
+- A directory link can carry a default environment: `cvault project bind acme/api --env staging`. Then `admin-panel/root` means staging.
+- Listing and export scopes accept `acme/staging` (everything in staging), `acme/staging/api` or `acme/api` (all environments).
+- `cvault service-move acme/api/staging-panel acme/staging/api/panel` moves an existing service into an environment (items, versions and hosts move with it).
+- Credentials default to the `password` field.
 
 ### Missing credentials
 When a task needs a login that isn't in the vault, the session hook, server instructions and "not found" errors all point Claude at `request_credential`. It opens native dialogs:
-1. **Path:** pre-filled with Claude's suggestion and editable. Paths with extra levels or messy characters are corrected automatically: `rezilens/develop/digrc-api-service/admin-panel/systemadmin` becomes `rezilens/digrc-api-service/develop-admin-panel/systemadmin`, with no second dialog. It only asks again when the intent can't be worked out.
+1. **Path:** pre-filled with Claude's suggestion and editable. Paths are corrected automatically, with no second dialog. Project and environment typed in the wrong order (`rezilens/digrc-api-service/develop/admin-panel/systemadmin`) become `rezilens/develop/digrc-api-service/admin-panel/systemadmin`; extra levels fold into the service name; messy characters are cleaned. It only asks again when the intent can't be worked out.
 2. **Fields:** username (visible), password (hidden), plus any extra fields Claude asks for. Masked fields (password, token, secret, key, pin, otp) are **asked twice**, and a mismatch asks again, so a typo can't be saved silently. For an existing item, leaving a field empty keeps its current value, and a new version is saved.
 
 If a login is rejected, Claude is told to stop after **one** attempt (accounts often lock after a few), never to try another environment's credential, and to offer `request_credential` on the same path to re-enter it.

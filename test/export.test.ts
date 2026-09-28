@@ -27,36 +27,36 @@ afterEach(() => vault.close());
 
 describe("export", () => {
   it("collects current values of a scope only", () => {
-    const items = collectItems(vault, ["acme", "api"]);
+    const items = collectItems(vault, { tenant: "acme", project: "api" });
     expect(items.map((i) => `${i.service}/${i.key}`).sort()).toEqual(["admin-panel/superadmin", "ssh/deploy-key", "stripe/api_key"]);
     expect(items.find((i) => i.key === "api_key")!.value).toBe("sk_new");
-    expect(collectItems(vault, [])).toHaveLength(4);
-    expect(collectItems(vault, ["acme", "api", "stripe"])).toHaveLength(1);
+    expect(collectItems(vault, {})).toHaveLength(4);
+    expect(collectItems(vault, { tenant: "acme", project: "api", service: "stripe" })).toHaveLength(1);
   });
 
   it("builds .env names relative to the scope and skips files", () => {
-    const project = toEnv(collectItems(vault, ["acme", "api"]), 2);
+    const project = toEnv(collectItems(vault, { tenant: "acme", project: "api" }), { tenant: "acme", project: "api" });
     expect(project.text).toContain("STRIPE_API_KEY=sk_new");
     expect(project.text).toContain('ADMIN_PANEL_SUPERADMIN_PASSWORD="p@ss w0rd"');
     expect(project.skipped).toEqual(["acme/api/ssh/deploy-key"]);
-    const service = toEnv(collectItems(vault, ["acme", "api", "stripe"]), 3);
+    const service = toEnv(collectItems(vault, { tenant: "acme", project: "api", service: "stripe" }), { tenant: "acme", project: "api", service: "stripe" });
     expect(service.text).toContain("API_KEY=sk_new");
   });
 
   it("refuses .env name collisions", () => {
     vault.setSecret(R("acme/api/stripe/API-KEY"), "dup");
-    expect(() => toEnv(collectItems(vault, ["acme", "api", "stripe"]), 3)).toThrow(/collision/);
+    expect(() => toEnv(collectItems(vault, { tenant: "acme", project: "api", service: "stripe" }), { tenant: "acme", project: "api", service: "stripe" })).toThrow(/collision/);
   });
 
   it("json keeps structure and labels", () => {
-    const doc = JSON.parse(toJson(collectItems(vault, ["acme"])));
+    const doc = JSON.parse(toJson(collectItems(vault, { tenant: "acme" })));
     expect(doc.vault.acme.api["admin-panel"].superadmin).toMatchObject({ role: "admin", default: true, fields: { username: "root" } });
   });
 });
 
 describe("encrypted bundle", () => {
   it("round-trips into another vault, including files and labels", () => {
-    const text = encryptBundle(collectItems(vault, ["acme"]), "bundle-pass-123", FAST);
+    const text = encryptBundle(collectItems(vault, { tenant: "acme" }), "bundle-pass-123", FAST);
     expect(text).not.toContain("sk_new");
     expect(text).not.toContain("p@ss");
     const other = Vault.init("another password", { home: join(dir, "v2"), kdf: FAST });
@@ -70,13 +70,13 @@ describe("encrypted bundle", () => {
   });
 
   it("rejects a wrong passphrase", () => {
-    const text = encryptBundle(collectItems(vault, ["globex"]), "bundle-pass-123", FAST);
+    const text = encryptBundle(collectItems(vault, { tenant: "globex" }), "bundle-pass-123", FAST);
     expect(() => decryptBundle(text, "nope-nope-nope")).toThrow(/wrong passphrase/);
     expect(() => decryptBundle("{}", "x")).toThrow(/not a cvault bundle/);
   });
 
   it("import remaps with --into and versions existing items", () => {
-    const items = decryptBundle(encryptBundle(collectItems(vault, ["acme", "api", "stripe"]), "bundle-pass-123", FAST), "bundle-pass-123");
+    const items = decryptBundle(encryptBundle(collectItems(vault, { tenant: "acme", project: "api", service: "stripe" }), "bundle-pass-123", FAST), "bundle-pass-123");
     expect(importItems(vault, items, { into: ["acme", "api-copy"] })).toMatchObject({ created: 1 });
     expect(vault.resolveValue(R("acme/api-copy/stripe/api_key"))).toBe("sk_new");
     expect(importItems(vault, items)).toMatchObject({ updated: 1 });
