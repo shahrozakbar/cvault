@@ -133,7 +133,16 @@ Run **`cvault`** with no arguments (or `cvault ui`). `cvault --help` lists the s
 - **Edit** values and fields, add or remove fields, replace files. Each change saves a new version.
 - **Labels:** role, default and description, without creating a new version.
 - **Manage:** create tenants, projects, services and items; link directories; toggle Claude reveal; archive and restore; roll back; **export** a project or the whole vault.
-- **Keys:** `↑↓` move · `⏎` select · **`Esc`** back / cancel the current action · `Ctrl+C` quit.
+- **Keys:**
+
+  | Key | Action |
+  |---|---|
+  | `↑` `↓` | move between rows (stays in the same column) |
+  | `←` `→` | move between columns in a row, e.g. tenant → project → environment on the tenant page |
+  | `→` on the last column / `⏎` | open the highlighted cell (project, environment, service, item) |
+  | `←` on the first column / `Esc` | back one screen; inside an action it cancels without changing anything |
+  | `Space` then `s` | search from any screen; `Esc` returns to where you were |
+  | `q` | quit |
 - **Responsive:** tables drop low-priority columns on narrow terminals.
 
 ---

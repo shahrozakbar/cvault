@@ -122,6 +122,23 @@ export function alignedRows(
   };
 }
 
+/** Like alignedRows, but returns the padded cells separately (for grids where cells are selectable). */
+export function alignedCells(
+  headers: string[],
+  rows: Cell[][],
+  opts: TableOpts = {},
+): { header: string[]; rule: string[]; lines: string[][] } {
+  const limit = (i: number) => opts.maxCols?.[i] ?? opts.maxCol ?? 40;
+  const body = rows.map((r) => headers.map((_, i) => (limit(i) ? truncate(cellText(r[i]), limit(i)) : cellText(r[i]))));
+  const widths = headers.map((h, i) => Math.max(width(h), ...body.map((r) => width(r[i]))));
+  const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - width(s)));
+  return {
+    header: headers.map((h, i) => pad(bold(h), widths[i])),
+    rule: widths.map((w) => "─".repeat(w)),
+    lines: body.map((r) => r.map((c, i) => pad(c, widths[i]))),
+  };
+}
+
 export function printTable(headers: string[], rows: Cell[][], opts: TableOpts = {}): void {
   console.log(renderTable(headers, rows, opts));
 }

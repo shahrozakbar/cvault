@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { collectItems, encryptBundle, type ExportFormat, toEnv, toJson, writeExport } from "./export.js";
 import { copyToClipboard } from "./sealed.js";
-import { alignedRows, auditTable, type Cell, humanSize, itemsTable, renderTable } from "./table.js";
+import { alignedCells, auditTable, type Cell, humanSize, itemsTable, renderTable } from "./table.js";
+import { type GridCell, type GridConfig, type GridLine, gridSelect } from "./grid.js";
 import { type ItemType, type Ref, type Scope, Vault, VaultError, formatRef, formatScope, formatServicePath, parseRef, serviceKey, splitServiceKey } from "./store.js";
 
 /**
@@ -92,7 +93,25 @@ function fit(line: string, w = termWidth()): string {
 }
 
 /** Clear the screen and draw header, breadcrumb, optional info line and pending flash messages. */
+/** Redraws the current page (header + extra printed blocks), used after returning from search. */
+let redraw: (() => void) | null = null;
+
+/** Print a block that belongs to the current page (and is redrawn with it). */
+function pagePrint(text: string): void {
+  console.log(text);
+  const prev = redraw;
+  redraw = () => {
+    prev?.();
+    console.log(text);
+  };
+}
+
 function page(vault: Vault, crumbs: string[], info?: string): void {
+  redraw = () => drawPage(vault, crumbs, info, false);
+  drawPage(vault, crumbs, info, true);
+}
+
+function drawPage(vault: Vault, crumbs: string[], info: string | undefined, withFlash: boolean): void {
   process.stdout.write("\x1b[H\x1b[2J");
   const s = stats(vault);
   const w = termWidth();
@@ -101,9 +120,9 @@ function page(vault: Vault, crumbs: string[], info?: string): void {
   );
   console.log(fit(` ${crumbs.map((c, i) => (i === crumbs.length - 1 ? bold(cyan(c)) : c)).join(dim(" › "))}`, w));
   if (info) console.log(fit(` ${dim(info)}`, w));
-  const hints = " Esc back/cancel · Ctrl+C quit ";
+  const hints = " Esc back · q quit · space s search ";
   console.log(dim("─".repeat(Math.max(2, w - hints.length - 2)) + hints + "──"));
-  if (flash.length) {
+  if (withFlash && flash.length) {
     console.log(flash.join("\n"));
     console.log();
     flash = [];
@@ -118,23 +137,84 @@ const SECTION_WIDTH = 34;
 const section = (title: string) =>
   new Separator(cyan(`── ${title} ${"─".repeat(Math.max(2, SECTION_WIDTH - title.length - 4))}`));
 
-type Choice<T> = { name: string; value: T } | Separator;
+/** A row whose cells are individually selectable (value per cell; undefined = not selectable). */
+type GridChoice<T> = { grid: GridCell<T>[] };
+type Choice<T> = { name: string; value: T } | Separator | GridChoice<T>;
+
+const QUIT = "__quit";
+const SEARCH = "__search";
+/** Thrown by menu() when the user presses q; caught by runUi. */
+class QuitRequested extends Error {
+  override name = "QuitRequested";
+}
+let uiVault: Vault | null = null;
+
+/** Grid rows → plain choices, for the stock search prompt (whole row = one choice). */
+function toPlainChoices<T>(choices: Choice<T>[]): Array<{ name: string; value: T } | Separator> {
+  return choices.map((c) => {
+    if (Separator.isSeparator(c) || !("grid" in c)) return c as { name: string; value: T } | Separator;
+    const value = c.grid.find((cell) => cell.value !== undefined)?.value as T;
+    return { name: c.grid.map((cell) => cell.text).join(dim(" │ ")), value };
+  });
+}
+
+function toGridLines<T>(choices: Choice<T>[]): GridLine<T>[] {
+  return choices.map((c): GridLine<T> => {
+    if (Separator.isSeparator(c)) return { kind: "sep", text: (c as Separator).separator };
+    if ("grid" in c) return { kind: "row", cells: c.grid };
+    return { kind: "row", cells: [{ text: c.name, value: c.value }] };
+  });
+}
 
 /**
  * Arrow-key menu. Inside an action, Esc cancels the whole action; on a plain page, Esc returns BACK.
  */
 async function menu<T>(message: string, choices: Choice<T>[], defaultValue?: T): Promise<T> {
-  const cfg = { message, choices, pageSize: PAGE_SIZE, loop: false, default: defaultValue };
-  if (actionSignal) return select<T>(cfg, promptCtx());
-  const ac = new AbortController();
-  const off = onEscape(ac);
-  try {
-    return await select<T>(cfg, { ...CTX, signal: ac.signal });
-  } catch (e) {
-    if ((e as Error).name === "AbortPromptError") return BACK as unknown as T;
-    throw e;
-  } finally {
-    off();
+  const lines = toGridLines(choices);
+  const ask = gridSelect as unknown as (cfg: GridConfig<T>, ctx: object) => Promise<T>;
+  // inside an action (e.g. picking a field to edit): ← cancels the action (like Esc); no quit/search shortcuts
+  if (actionSignal) {
+    const r = await ask({ message, lines, default: defaultValue, pageSize: PAGE_SIZE, back: BACK as unknown as T }, promptCtx());
+    if ((r as unknown) === BACK && !choices.some((c) => !Separator.isSeparator(c) && "value" in c && c.value === (BACK as unknown))) {
+      const err = new Error("cancelled");
+      err.name = "AbortPromptError";
+      throw err;
+    }
+    return r;
+  }
+  for (;;) {
+    const ac = new AbortController();
+    const off = onEscape(ac);
+    let r: T;
+    try {
+      r = await ask(
+        {
+          message,
+          lines,
+          default: defaultValue,
+          pageSize: PAGE_SIZE,
+          back: BACK as unknown as T,
+          quit: QUIT as unknown as T,
+          search: SEARCH as unknown as T,
+        },
+        { ...CTX, signal: ac.signal },
+      );
+    } catch (e) {
+      if ((e as Error).name === "AbortPromptError") return BACK as unknown as T;
+      throw e;
+    } finally {
+      off();
+    }
+    if ((r as unknown) === QUIT) throw new QuitRequested();
+    if ((r as unknown) === SEARCH && uiVault) {
+      const here = redraw;
+      await searchAll(uiVault);
+      redraw = here;
+      here?.();
+      continue;
+    }
+    // inside an action, ← means cancel
+    return r;
   }
 }
 
@@ -145,8 +225,12 @@ async function menu<T>(message: string, choices: Choice<T>[], defaultValue?: T):
  */
 function tableSection<T extends string | number>(
   headers: string[],
-  /** `more` = continuation lines shown under the row (not selectable), e.g. one project per line */
-  rows: Array<{ cells: Cell[]; value: T; more?: Cell[][] }>,
+  /**
+   * `more` = continuation lines under the row (e.g. one project per line).
+   * `cellValues` / `moreValues` make individual cells selectable (←/→ between them); without them
+   * the whole row is one choice with `value`.
+   */
+  rows: Array<{ cells: Cell[]; value: T; more?: Cell[][]; cellValues?: (T | undefined)[]; moreValues?: (T | undefined)[][] }>,
   maxCols: Record<number, number> = {},
   empty = "(nothing here yet)",
   dropOrder: string[] = [],
@@ -157,42 +241,69 @@ function tableSection<T extends string | number>(
   const allLines = rows.flatMap((r) => [r.cells, ...(r.more ?? [])]);
   let keep = headers.map((_, i) => i).filter((i) => allLines.some((cells) => !blank(cells[i])));
   if (!keep.length) keep = [0];
+  const SEP = dim(" │ ");
   const build = () => {
     const limits: Record<number, number> = {};
     keep.forEach((orig, j) => {
       if (maxCols[orig] !== undefined) limits[j] = maxCols[orig];
     });
-    // separators render with 1 leading char, choices with 2 (cursor + space) → indent the header by 1
-    return alignedRows(
+    return alignedCells(
       keep.map((i) => headers[i]),
-      rows.flatMap((r) => [r.cells, ...(r.more ?? [])]).map((cells) => keep.map((i) => cells[i])),
-      { indent: 1, maxCol: 40, maxCols: limits },
+      allLines.map((cells) => keep.map((i) => cells[i])),
+      { maxCol: 40, maxCols: limits },
     );
   };
   const visible = (line: string) => [...line.replace(/\x1b\[[0-9;]*m/g, "")].length;
   let t = build();
   for (const name of dropOrder) {
-    if (visible(t.header) + 2 <= termWidth()) break;
+    if (visible(t.header.join(" │ ")) + 4 <= termWidth()) break;
     keep = keep.filter((i) => headers[i] !== name);
     t = build();
   }
-  const out: Choice<T>[] = [new Separator(t.header), new Separator(t.rule)];
+  // separators render with 1 leading char, rows with 2 (cursor + space) → one extra space aligns them
+  const out: Choice<T>[] = [new Separator(` ${t.header.join(SEP)}`), new Separator(` ${dim(t.rule.join("─┼─"))}`)];
   let line = 0;
+  const gridRow = (cells: string[], values: (T | undefined)[]): GridChoice<T> => ({
+    grid: cells.map((text, j) => ({ text, value: values[keep[j]] })),
+  });
   for (const r of rows) {
-    out.push({ name: t.lines[line++], value: r.value });
-    // separators render with 1 leading char, choices with 2 → one extra space keeps columns aligned
-    for (let k = 0; k < (r.more?.length ?? 0); k++) out.push(new Separator(` ${t.lines[line++]}`));
+    const cells = t.lines[line++];
+    out.push(r.cellValues ? gridRow(cells, r.cellValues) : { grid: [{ text: cells.join(SEP), value: r.value }] });
+    for (let k = 0; k < (r.more?.length ?? 0); k++) {
+      const moreCells = t.lines[line++];
+      const values = r.moreValues?.[k];
+      out.push(values && values.some((v) => v !== undefined) ? gridRow(moreCells, values) : new Separator(` ${moreCells.join(SEP)}`));
+    }
   }
   return out;
 }
 
-/** Spread lists over continuation lines: first entry on the row, the rest one per line below. */
-function spread(first: Cell[], lists: Record<number, string[]>): { cells: Cell[]; more?: Cell[][] } {
+/**
+ * Spread lists over continuation lines: first entry on the row, the rest one per line below.
+ * `valueOf(col, entry)` makes list entries selectable; `firstValues` sets values for the row's own cells.
+ */
+function spread<T>(
+  first: Cell[],
+  lists: Record<number, string[]>,
+  valueOf?: (col: number, entry: string) => T | undefined,
+  firstValues: Record<number, T> = {},
+): { cells: Cell[]; more?: Cell[][]; cellValues?: (T | undefined)[]; moreValues?: (T | undefined)[][] } {
   const n = Math.max(1, ...Object.values(lists).map((l) => l.length));
   const blank = " ";
   const lineAt = (k: number) => first.map((c, i) => (i in lists ? (lists[i][k] ?? blank) : k === 0 ? c : blank));
+  const valuesAt = (k: number) =>
+    first.map((_, i) => {
+      if (i in lists) return lists[i][k] !== undefined && valueOf ? valueOf(i, lists[i][k]) : undefined;
+      return k === 0 ? firstValues[i] : undefined;
+    });
   const more = Array.from({ length: n - 1 }, (_, k) => lineAt(k + 1));
-  return { cells: lineAt(0), ...(more.length ? { more } : {}) };
+  const out: { cells: Cell[]; more?: Cell[][]; cellValues?: (T | undefined)[]; moreValues?: (T | undefined)[][] } = { cells: lineAt(0) };
+  if (more.length) out.more = more;
+  if (valueOf) {
+    out.cellValues = valuesAt(0);
+    if (more.length) out.moreValues = Array.from({ length: n - 1 }, (_, k) => valuesAt(k + 1));
+  }
+  return out;
 }
 
 const status = (archived?: string) => (archived ? yellow("archived") : green("active"));
@@ -260,10 +371,11 @@ async function copy(vault: Vault, ref: Ref, label: string): Promise<void> {
 // ---------- entry ----------
 
 export async function runUi(vault: Vault): Promise<void> {
+  uiVault = vault;
   try {
     await mainMenu(vault);
   } catch (e) {
-    if ((e as Error).name !== "ExitPromptError") throw e;
+    if (!["ExitPromptError", "QuitRequested"].includes((e as Error).name)) throw e;
   }
   process.stdout.write("\x1b[H\x1b[2J");
   console.log(dim("cvault closed"));
@@ -298,7 +410,7 @@ async function mainMenu(vault: Vault): Promise<void> {
 /** A read-only page for a big table: header + table + a single "back" choice (Esc works too). */
 async function viewPage(vault: Vault, crumbs: string[], text: string): Promise<void> {
   page(vault, crumbs);
-  console.log(text);
+  pagePrint(text);
   await menu<string>(dim("Esc or Enter to go back"), [backChoice]);
 }
 
@@ -318,7 +430,8 @@ async function searchAll(vault: Vault): Promise<void> {
       source: (term) => {
         const t = (term ?? "").toLowerCase();
         const hits = all.filter((i) => !t || [i.ref, i.role, i.description, i.type].some((x) => x?.toLowerCase().includes(t)));
-        return [
+        return toPlainChoices([
+          
           ...tableSection(
             ["REF", "TYPE", "ROLE", "DEFAULT", "FIELDS / FILE", "VER", "DESCRIPTION"],
             hits.map((i) => ({
@@ -330,7 +443,7 @@ async function searchAll(vault: Vault): Promise<void> {
             ["DESCRIPTION", "VER", "DEFAULT", "ROLE", "TYPE"],
           ),
           { name: dim("← back"), value: BACK },
-        ];
+        ]);
       },
     },
     { ...CTX, signal: ac.signal },
@@ -359,7 +472,12 @@ async function tenantsMenu(vault: Vault): Promise<void> {
           const lists: Record<number, string[]> = {};
           if (names.length) lists[2] = names;
           if (envs.length) lists[3] = envs;
-          const row = spread([t.tenant, t.name, names.length ? "" : t.projects, "", status(t.archived_at)], lists);
+          const row = spread<string>(
+            [t.tenant, t.name, names.length ? "" : t.projects, "", status(t.archived_at)],
+            lists,
+            (col, entry) => (col === 2 ? `p:${t.tenant}\u0000${entry}` : `e:${t.tenant}\u0000${entry}`),
+            { 0: t.tenant },
+          );
           return { ...row, value: t.tenant };
         }),
         { 2: 60, 3: 40 },
@@ -371,6 +489,12 @@ async function tenantsMenu(vault: Vault): Promise<void> {
       backChoice,
     ]);
     if (a === BACK) return;
+    if (a.startsWith("p:") || a.startsWith("e:")) {
+      const [tenant, name] = a.slice(2).split("\u0000");
+      if (a.startsWith("p:")) await projectMenu(vault, tenant, name);
+      else await envServicesMenu(vault, tenant, name);
+      continue;
+    }
     if (a === "__new") {
       await act(async () => {
         const slug = await slugPrompt("Tenant slug (e.g. acme)");
@@ -438,7 +562,12 @@ async function envsMenu(vault: Vault, tenant: string): Promise<void> {
         ["ENVIRONMENT", "PROJECTS", "SERVICES", "ITEMS"],
         order.map((e) => {
           const g = envs.get(e)!;
-          const row = spread([e === NO_ENV ? dim(envLabel(e)) : cyan(e), "", g.services, g.items], { 1: [...g.projects].sort() });
+          const row = spread<string>(
+            [e === NO_ENV ? dim(envLabel(e)) : cyan(e), "", g.services, g.items],
+            { 1: [...g.projects].sort() },
+            (_, proj) => `__proj:${proj}`,
+            { 0: e },
+          );
           return { ...row, value: e };
         }),
         { 1: 60 },
@@ -935,7 +1064,7 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
     }
     const key = keyOf(info.ref);
     page(vault, ["home", ...crumbsOf(ref), key]);
-    console.log(detailsTable(info, vault.allowedHosts(ref.tenant, ref.project, serviceKey(ref.env, ref.service))));
+    pagePrint(detailsTable(info, vault.allowedHosts(ref.tenant, ref.project, serviceKey(ref.env, ref.service))));
 
     const copyOpts =
       info.type === "credential"
