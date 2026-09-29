@@ -145,13 +145,18 @@ async function menu<T>(message: string, choices: Choice<T>[], defaultValue?: T):
  */
 function tableSection<T extends string | number>(
   headers: string[],
-  rows: Array<{ cells: Cell[]; value: T }>,
+  /** `more` = continuation lines shown under the row (not selectable), e.g. one project per line */
+  rows: Array<{ cells: Cell[]; value: T; more?: Cell[][] }>,
   maxCols: Record<number, number> = {},
   empty = "(nothing here yet)",
   dropOrder: string[] = [],
 ): Choice<T>[] {
   if (!rows.length) return [new Separator(dim(` ${empty}`))];
-  let keep = headers.map((_, i) => i);
+  // hide columns that are empty in every row (e.g. URL "-" everywhere, ENV on a project without environments)
+  const blank = (c: Cell) => c === null || c === undefined || c === "" || c === " ";
+  const allLines = rows.flatMap((r) => [r.cells, ...(r.more ?? [])]);
+  let keep = headers.map((_, i) => i).filter((i) => allLines.some((cells) => !blank(cells[i])));
+  if (!keep.length) keep = [0];
   const build = () => {
     const limits: Record<number, number> = {};
     keep.forEach((orig, j) => {
@@ -160,7 +165,7 @@ function tableSection<T extends string | number>(
     // separators render with 1 leading char, choices with 2 (cursor + space) → indent the header by 1
     return alignedRows(
       keep.map((i) => headers[i]),
-      rows.map((r) => keep.map((i) => r.cells[i])),
+      rows.flatMap((r) => [r.cells, ...(r.more ?? [])]).map((cells) => keep.map((i) => cells[i])),
       { indent: 1, maxCol: 40, maxCols: limits },
     );
   };
@@ -171,7 +176,23 @@ function tableSection<T extends string | number>(
     keep = keep.filter((i) => headers[i] !== name);
     t = build();
   }
-  return [new Separator(t.header), new Separator(t.rule), ...rows.map((r, i) => ({ name: t.lines[i], value: r.value }))];
+  const out: Choice<T>[] = [new Separator(t.header), new Separator(t.rule)];
+  let line = 0;
+  for (const r of rows) {
+    out.push({ name: t.lines[line++], value: r.value });
+    // separators render with 1 leading char, choices with 2 → one extra space keeps columns aligned
+    for (let k = 0; k < (r.more?.length ?? 0); k++) out.push(new Separator(` ${t.lines[line++]}`));
+  }
+  return out;
+}
+
+/** Spread lists over continuation lines: first entry on the row, the rest one per line below. */
+function spread(first: Cell[], lists: Record<number, string[]>): { cells: Cell[]; more?: Cell[][] } {
+  const n = Math.max(1, ...Object.values(lists).map((l) => l.length));
+  const blank = " ";
+  const lineAt = (k: number) => first.map((c, i) => (i in lists ? (lists[i][k] ?? blank) : k === 0 ? c : blank));
+  const more = Array.from({ length: n - 1 }, (_, k) => lineAt(k + 1));
+  return { cells: lineAt(0), ...(more.length ? { more } : {}) };
 }
 
 const status = (archived?: string) => (archived ? yellow("archived") : green("active"));
@@ -268,19 +289,31 @@ async function mainMenu(vault: Vault): Promise<void> {
     if (a === "ctx" && ctx) await projectMenu(vault, ctx.tenant, ctx.project);
     if (a === "search") await searchAll(vault);
     if (a === "browse") await tenantsMenu(vault);
-    if (a === "table") note(itemsTable(allItems(vault), "All items"));
-    if (a === "audit") note(auditTable(vault.auditLog(30) as never));
+    if (a === "table") await viewPage(vault, ["home", "all items"], itemsTable(allItems(vault), "All items"));
+    if (a === "audit") await viewPage(vault, ["home", "audit log"], auditTable(vault.auditLog(30) as never));
     if (a === "export") await act(() => exportFlow(vault, {}));
   }
+}
+
+/** A read-only page for a big table: header + table + a single "back" choice (Esc works too). */
+async function viewPage(vault: Vault, crumbs: string[], text: string): Promise<void> {
+  page(vault, crumbs);
+  console.log(text);
+  await menu<string>(dim("Esc or Enter to go back"), [backChoice]);
 }
 
 async function searchAll(vault: Vault): Promise<void> {
   const all = allItems(vault);
   page(vault, ["home", "search"], "type to filter by ref, role, description or type");
   if (!all.length) return void note(dim("vault is empty"));
-  const picked = await search<string>(
+  // Esc leaves the search (like every other menu); the search prompt doesn't do this on its own
+  const ac = new AbortController();
+  const off = onEscape(ac);
+  let picked: string;
+  try {
+    picked = await search<string>(
     {
-      message: "Search",
+      message: "Search  (type to filter · Esc to go back)",
       pageSize: PAGE_SIZE,
       source: (term) => {
         const t = (term ?? "").toLowerCase();
@@ -300,8 +333,14 @@ async function searchAll(vault: Vault): Promise<void> {
         ];
       },
     },
-    CTX,
+    { ...CTX, signal: ac.signal },
   );
+  } catch (e) {
+    if ((e as Error).name === "AbortPromptError") return;
+    throw e;
+  } finally {
+    off();
+  }
   if (picked !== BACK) await itemMenu(vault, parseRef(picked));
 }
 
@@ -313,8 +352,19 @@ async function tenantsMenu(vault: Vault): Promise<void> {
     page(vault, ["home", "tenants"]);
     const a = await menu<string>("Pick a tenant", [
       ...tableSection(
-        ["TENANT", "NAME", "PROJECTS", "STATUS"],
-        ts.map((t) => ({ cells: [t.tenant, t.name, t.projects, status(t.archived_at)], value: t.tenant })),
+        ["TENANT", "NAME", "PROJECTS", "ENVIRONMENTS", "STATUS"],
+        ts.map((t) => {
+          const names = t.archived_at ? [] : (vault.listProjects(t.tenant) as unknown as Array<{ project: string }>).map((p) => p.project);
+          const envs = t.archived_at ? [] : vault.listEnvironments(t.tenant);
+          const lists: Record<number, string[]> = {};
+          if (names.length) lists[2] = names;
+          if (envs.length) lists[3] = envs;
+          const row = spread([t.tenant, t.name, names.length ? "" : t.projects, "", status(t.archived_at)], lists);
+          return { ...row, value: t.tenant };
+        }),
+        { 2: 60, 3: 40 },
+        undefined,
+        ["NAME", "ENVIRONMENTS"],
       ),
       section("Actions"),
       { name: "+ New tenant…", value: "__new" },
@@ -377,16 +427,28 @@ async function envsMenu(vault: Vault, tenant: string): Promise<void> {
     }
     const order = [...envs.keys()].sort((a, b) => (a === NO_ENV ? 1 : b === NO_ENV ? -1 : a.localeCompare(b)));
     page(vault, ["home", tenant]);
-    const a = await menu<string>("Pick an environment", [
+    const projects = (vault.listProjects(tenant) as unknown as Array<{ project: string }>).map((p) => p.project);
+    const projectInfo = (proj: string) => {
+      const mine = svcs.filter((sv) => sv.project === proj);
+      const envNames = [...new Set(mine.map((sv) => sv.environment ?? "no environment"))];
+      return dim(`${mine.length} service${mine.length === 1 ? "" : "s"} · ${envNames.join(", ") || "empty"}`);
+    };
+    const a = await menu<string>("Pick an environment or a project", [
       ...tableSection(
         ["ENVIRONMENT", "PROJECTS", "SERVICES", "ITEMS"],
         order.map((e) => {
           const g = envs.get(e)!;
-          return { cells: [e === NO_ENV ? dim(envLabel(e)) : cyan(e), [...g.projects].join(", "), g.services, g.items], value: e };
+          const row = spread([e === NO_ENV ? dim(envLabel(e)) : cyan(e), "", g.services, g.items], { 1: [...g.projects].sort() });
+          return { ...row, value: e };
         }),
         { 1: 60 },
         "no services yet — add one below",
       ),
+      section("By project"),
+      ...projects.map((proj) => ({
+        name: `${proj.padEnd(Math.max(...projects.map((x) => x.length)))}  ${projectInfo(proj)}`,
+        value: `__proj:${proj}`,
+      })),
       section("Actions"),
       { name: "+ New environment…", value: "__newenv" },
       { name: "Projects & settings…", value: "__projects" },
@@ -394,6 +456,7 @@ async function envsMenu(vault: Vault, tenant: string): Promise<void> {
     ]);
     if (a === BACK) return;
     if (a === "__projects") await projectsMenu(vault, tenant);
+    else if (a.startsWith("__proj:")) await projectMenu(vault, tenant, a.slice(7));
     else if (a === "__newenv") {
       await act(async () => {
         const env = await slugPrompt("Environment name (e.g. develop, staging, prod)");
@@ -417,7 +480,7 @@ async function envServicesMenu(vault: Vault, tenant: string, env: string): Promi
             sv.service,
             sv.project,
             sv.url,
-            sv.items,
+            sv.items + ((sv as SvcRow & { archived_items?: number }).archived_items ? dim(` (+${(sv as SvcRow & { archived_items?: number }).archived_items} archived)`) : ""),
             vault.allowedHosts(tenant, sv.project, sv.key).join(", "),
             status(sv.archived_at),
           ],
@@ -478,7 +541,7 @@ async function projectsMenu(vault: Vault, tenant: string): Promise<void> {
       bound_paths: string[];
       archived_at?: string;
     }>;
-    page(vault, ["home", "tenants", tenant]);
+    page(vault, ["home", tenant, "projects"]);
     const a = await menu<string>("Pick a project", [
       ...tableSection(
         ["PROJECT", "NAME", "SERVICES", "LINKED DIRECTORY", "STATUS"],
@@ -546,7 +609,16 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
     }
     if (!info) return;
     const items = vault.listItems(tenant, project) as unknown as ItemInfo[];
-    const linkedHere = info.bound_paths.includes(cwdCanonical());
+    const cwd = cwdCanonical();
+    const linkedHere = info.bound_paths.includes(cwd);
+    const linkable =
+      !linkedHere &&
+      cwd !== "/" &&
+      cwd !== homedir() &&
+      !cwd.startsWith("/tmp") &&
+      !cwd.startsWith("/private/tmp") &&
+      !cwd.startsWith("/private/var") &&
+      !vault.resolveContext(cwd);
     page(
       vault,
       ["home", tenant, project],
@@ -570,7 +642,7 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
       { name: "+ New item…", value: "__new" },
       { name: "Services…", value: "__services" },
       { name: "Export this project…", value: "__export" },
-      ...(linkedHere ? [] : [{ name: `Link this directory ${dim(tilde(process.cwd()))}`, value: "__bind" }]),
+      ...(linkable ? [{ name: `Link this directory ${dim(tilde(process.cwd()))}`, value: "__bind" }] : []),
       { name: `Turn Claude reveal ${info.allow_reveal ? "OFF" : "ON"}`, value: "__reveal" },
       { name: yellow("Archive this project"), value: "__archive" },
       backChoice,
@@ -823,10 +895,21 @@ async function exportFlow(vault: Vault, scope: Scope): Promise<void> {
 
 // ---------- item ----------
 
-function detailsTable(info: ItemInfo): string {
+/** Values the user just asked to see: shown inside the item's details table until the next action. */
+let revealed: { ref: string; version: number; rows: [string, string][] } | null = null;
+
+function detailsTable(info: ItemInfo, hosts: string[]): string {
+  const shown = revealed && revealed.ref === info.ref ? revealed : null;
+  revealed = null;
   return renderTable(
     ["PROPERTY", "VALUE"],
     [
+      ...(shown
+        ? [
+            ...shown.rows.map(([k, v]) => [yellow(k), v] as Cell[]),
+            [dim("─────────"), dim(`values of v${shown.version} · hidden again after your next action`)] as Cell[],
+          ]
+        : []),
       ["ref", info.ref],
       ["type", info.type],
       ...(info.type === "credential" ? [["fields", info.fields?.join(", ")] as Cell[]] : []),
@@ -834,7 +917,8 @@ function detailsTable(info: ItemInfo): string {
       ["role", info.role ? `${info.role}${info.default ? " (default)" : ""}` : info.default ? "(default)" : ""],
       ["version", `v${info.version} · updated ${info.updated_at} UTC`],
       ["description", info.description],
-      ...(info.locked ? [["LOCKED", `${info.locked.at} UTC - ${info.locked.reason}`] as Cell[]] : []),
+      ["allowed hosts", hosts.length ? hosts.join(", ") : dim("any (no restriction)")],
+      ...(info.locked ? [[red("LOCKED"), `${info.locked.at} UTC - ${info.locked.reason}`] as Cell[]] : []),
     ],
     { maxCol: 0 },
   );
@@ -851,7 +935,7 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
     }
     const key = keyOf(info.ref);
     page(vault, ["home", ...crumbsOf(ref), key]);
-    console.log(detailsTable(info));
+    console.log(detailsTable(info, vault.allowedHosts(ref.tenant, ref.project, serviceKey(ref.env, ref.service))));
 
     const copyOpts =
       info.type === "credential"
@@ -890,6 +974,10 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
     ], last);
     if (a === BACK) return;
     last = a;
+    if (a === "versions") {
+      await versionsMenu(vault, ref, info);
+      continue;
+    }
     await act(async () => {
       if (a === "copy") await copy(vault, ref, info.type === "file" ? "file contents" : "value");
       else if (a.startsWith("copy:")) await copy(vault, { ...ref, field: a.slice(5) }, a.slice(5));
@@ -911,7 +999,6 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
         vault.unlockItem(ref, SOURCE);
         ok(`unlocked ${info.ref}`);
       }
-      else if (a === "versions") await versionsMenu(vault, ref, info);
       else if (a === "archive") {
         if (await confirm({ message: `Archive ${info.ref}?`, default: false })) ok(vault.archive(vault.resolveTarget(info.ref), SOURCE));
       }
@@ -921,9 +1008,14 @@ async function itemMenu(vault: Vault, ref: Ref): Promise<void> {
 
 function showItem(vault: Vault, ref: Ref): void {
   const item = vault.getItem(ref, SOURCE);
-  const title = `${ref.key} (v${item.version}) ${dim("— visible until your next action")}`;
-  const rows = typeof item.value === "string" ? [["value", item.value]] : Object.entries(item.value);
-  note(renderTable(["FIELD", "VALUE"], rows, { title, maxCol: 0 }));
+  const rows: [string, string][] = typeof item.value === "string" ? [["value", item.value]] : Object.entries(item.value);
+  if (ref.version) {
+    // an old version: its own table (the item page shows the current version)
+    const title = `${ref.key} v${item.version} ${dim("— visible until your next action")}`;
+    note(renderTable(["FIELD", "VALUE"], rows, { title, maxCol: 0 }));
+    return;
+  }
+  revealed = { ref: formatRef({ ...ref, field: undefined, version: undefined }), version: item.version, rows };
 }
 
 async function credentialFields(vault: Vault, ref: Ref): Promise<Record<string, string>> {

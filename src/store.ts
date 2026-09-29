@@ -385,10 +385,11 @@ export class Vault {
     return this.db
       .prepare(
         `SELECT s.slug AS service, s.name, s.url, s.notes, s.archived_at,
-                (SELECT COUNT(*) FROM items i WHERE i.service_id = s.id AND (? OR i.archived_at IS NULL)) AS items
+                (SELECT COUNT(*) FROM items i WHERE i.service_id = s.id AND i.archived_at IS NULL) AS items,
+                (SELECT COUNT(*) FROM items i WHERE i.service_id = s.id AND i.archived_at IS NOT NULL) AS archived_items
          FROM services s WHERE s.project_id = ? AND (? OR s.archived_at IS NULL) ORDER BY s.slug`,
       )
-      .all(includeArchived ? 1 : 0, pid, includeArchived ? 1 : 0)
+      .all(pid, includeArchived ? 1 : 0)
       .map((r) => {
         const row = r as Record<string, unknown>;
         const { env, service } = splitServiceKey(row.service as string);

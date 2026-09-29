@@ -29,21 +29,72 @@ interface TableOpts {
   maxCol?: number;
   /** per-column overrides, by index (0 = unlimited) */
   maxCols?: Record<number, number>;
+  /** total width to fit in (default: terminal width on a TTY, unlimited when piped) */
+  maxWidth?: number;
+  /** column headers to drop, least important first, while the table is too wide */
+  dropOrder?: string[];
+  /** column headers to shorten (with …) next, while still too wide */
+  shrink?: string[];
+  /**
+   * Explicit fitting plan, applied in order while the table is too wide (overrides dropOrder/shrink):
+   * { drop: "HEADER" } hides a column; { shrink: "HEADER", min: n } shortens it down to n chars.
+   */
+  steps?: Array<{ drop: string } | { shrink: string; min?: number }>;
+}
+
+const MIN_COL = 8;
+
+/** Terminal width on a TTY; unlimited when piped so files/scripts get the full table. */
+export function terminalWidth(): number {
+  return process.stdout.isTTY && process.stdout.columns ? process.stdout.columns : Number.POSITIVE_INFINITY;
 }
 
 export function renderTable(headers: string[], rows: Cell[][], opts: TableOpts = {}): string {
   const limit = (i: number) => opts.maxCols?.[i] ?? opts.maxCol ?? 60;
-  const body = rows.map((r) => headers.map((_, i) => (limit(i) ? truncate(cellText(r[i]), limit(i)) : cellText(r[i]))));
-  const widths = headers.map((h, i) => Math.max(width(h), ...body.map((r) => width(r[i]))));
-  const pad = (s: string, w: number) => s + " ".repeat(w - width(s));
-  const line = (l: string, m: string, r: string) => l + widths.map((w) => "─".repeat(w + 2)).join(m) + r;
-  const row = (cells: string[]) => "│" + cells.map((c, i) => ` ${pad(c, widths[i])} `).join("│") + "│";
+  const raw = rows.map((r) => headers.map((_, i) => cellText(r[i])));
+  const natural = (i: number) =>
+    Math.max(width(headers[i]), ...raw.map((r) => (limit(i) ? Math.min(width(r[i]), limit(i)) : width(r[i]))));
+  let keep = headers.map((_, i) => i);
+  const w = new Map(keep.map((i) => [i, natural(i)]));
+  const total = () => keep.reduce((sum, i) => sum + w.get(i)! + 3, 1);
+  const max = opts.maxWidth ?? terminalWidth();
+
+  const steps =
+    opts.steps ??
+    ([...(opts.dropOrder ?? []).map((drop) => ({ drop })), ...(opts.shrink ?? []).map((shrink) => ({ shrink }))] as NonNullable<TableOpts["steps"]>);
+  for (const step of steps) {
+    if (total() <= max) break;
+    if ("drop" in step) {
+      if (keep.length > 1) keep = keep.filter((i) => headers[i] !== step.drop);
+    } else {
+      const i = headers.indexOf(step.shrink);
+      if (!keep.includes(i)) continue;
+      const floor = Math.max((step as { shrink: string; min?: number }).min ?? MIN_COL, width(headers[i]));
+      w.set(i, Math.max(Math.min(floor, w.get(i)!), w.get(i)! - (total() - max)));
+    }
+  }
+  // 3. last resort: shorten the widest column until it fits (or nothing can shrink)
+  while (total() > max) {
+    const widest = keep.reduce((a, b) => (w.get(b)! > w.get(a)! ? b : a));
+    if (w.get(widest)! <= MIN_COL) break;
+    w.set(widest, Math.max(MIN_COL, w.get(widest)! - (total() - max)));
+  }
+
+  const widths = keep.map((i) => w.get(i)!);
+  const body = raw.map((r) => keep.map((i, j) => truncate(r[i], widths[j])));
+  const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - width(s)));
+  const line = (l: string, m: string, r: string) => l + widths.map((n) => "─".repeat(n + 2)).join(m) + r;
+  const row = (cells: string[]) => "│" + cells.map((c, j) => ` ${pad(c, widths[j])} `).join("│") + "│";
+  const dropped = headers.length - keep.length;
+  const title = opts.title
+    ? bold(opts.title) + (dropped ? dim(`  (${dropped} column${dropped > 1 ? "s" : ""} hidden - widen the terminal to see all)`) : "")
+    : null;
   const out = [
-    ...(opts.title ? [bold(opts.title)] : []),
+    ...(title ? [title] : []),
     line("┌", "┬", "┐"),
-    row(headers.map((h) => bold(h))),
+    row(keep.map((i, j) => bold(truncate(headers[i], widths[j])))),
     line("├", "┼", "┤"),
-    ...(body.length ? body.map(row) : [row(headers.map((_, i) => (i === 0 ? dim("(none)") : "")))]),
+    ...(body.length ? body.map(row) : [row(keep.map((_, j) => (j === 0 ? dim("(none)") : "")))]),
     line("└", "┴", "┘"),
   ];
   return out.join("\n");
@@ -111,7 +162,23 @@ export function itemsTable(items: ItemRowLike[], title = "Items"): string {
       i.updated_at,
       i.description,
     ]),
-    { title: `${title} (${items.length})`, maxCol: 50, maxCols: { 0: 0, 4: 0, 7: 45 } },
+    {
+      title: `${title} (${items.length})`,
+      maxCol: 50,
+      maxCols: { 0: 0, 4: 0, 7: 45 },
+      steps: [
+        { drop: "UPDATED" },
+        { shrink: "DESCRIPTION", min: 20 },
+        { shrink: "FIELDS / FILE", min: 24 },
+        { drop: "VER" },
+        { drop: "DEFAULT" },
+        { drop: "DESCRIPTION" },
+        { drop: "TYPE" },
+        { shrink: "FIELDS / FILE", min: 14 },
+        { drop: "ROLE" },
+        { shrink: "REF", min: 30 },
+      ],
+    },
   );
 }
 
@@ -119,7 +186,12 @@ export function auditTable(rows: Array<{ ts: string; source: string; ref: string
   return renderTable(
     ["TIME (UTC)", "SOURCE", "REF", "ACTION"],
     rows.map((r) => [r.ts, r.source, r.ref, r.action]),
-    { title: "Audit log", maxCol: 70, maxCols: { 2: 0 } },
+    {
+      title: "Audit log",
+      maxCol: 70,
+      maxCols: { 2: 0 },
+      steps: [{ shrink: "ACTION", min: 28 }, { shrink: "REF", min: 40 }, { drop: "SOURCE" }, { shrink: "ACTION", min: 14 }, { shrink: "REF", min: 24 }],
+    },
   );
 }
 
@@ -129,6 +201,6 @@ export function versionsTable(
   return renderTable(
     ["VERSION", "CURRENT", "TYPE", "CREATED (UTC)", "SOURCE", "FIELDS / FILE"],
     rows.map((v) => [`v${v.version}`, v.current ? "yes" : "", v.type, v.created_at, v.source, v.fields?.join(", ") ?? v.filename]),
-    { title: "Versions" },
+    { title: "Versions", dropOrder: ["SOURCE", "TYPE"], shrink: ["FIELDS / FILE"] },
   );
 }
