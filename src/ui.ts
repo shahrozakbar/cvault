@@ -545,9 +545,22 @@ async function tenantsMenu(vault: Vault): Promise<void> {
       ),
       section("Actions"),
       { name: "+ New tenant…", value: "__new" },
+      { name: "+ New project…", value: "__newproject" },
+      { name: "+ New environment…", value: "__newenv" },
       backChoice,
     ]);
     if (a === BACK) return;
+    if (a === "__newproject" || a === "__newenv") {
+      await act(async () => {
+        const tenant = await pickTenant(vault);
+        if (a === "__newproject") await newProject(vault, tenant);
+        else {
+          const env = await slugPrompt("Environment name (e.g. develop, staging, prod)");
+          ok(`service ${await createServiceIn(vault, tenant, env)} created - environment ${env} is ready`);
+        }
+      });
+      continue;
+    }
     if (a.startsWith("p:") || a.startsWith("e:")) {
       const [tenant, name] = a.slice(2).split("\u0000");
       if (a.startsWith("p:")) await projectMenu(vault, tenant, name);
@@ -724,6 +737,30 @@ async function createServiceIn(vault: Vault, tenant: string, env: string): Promi
   return formatServicePath(tenant, project, key);
 }
 
+/** Ask which (active) tenant to use; skips the question when there is only one. */
+async function pickTenant(vault: Vault): Promise<string> {
+  const tenants = (vault.listTenants() as Array<{ tenant: string }>).map((t) => t.tenant);
+  if (tenants.length === 1) return tenants[0];
+  const t = await menu<string>("Which tenant?", [
+    ...tenants.map((x) => ({ name: x, value: x })),
+    { name: "+ New tenant…", value: "__new" },
+  ]);
+  if (t !== "__new") return t;
+  const slug = await slugPrompt("Tenant slug (e.g. acme)");
+  vault.ensureTenant(slug);
+  return slug;
+}
+
+/** Create a project in `tenant`, optionally linking the current directory. */
+async function newProject(vault: Vault, tenant: string): Promise<void> {
+  const slug = await slugPrompt("Project slug (e.g. api-service)");
+  vault.ensureProject(tenant, slug);
+  ok(`project ${tenant}/${slug} created`);
+  if (await confirm({ message: `Link the current directory (${tilde(process.cwd())}) to it?`, default: false })) {
+    ok(`linked ${tilde(vault.bindPath(tenant, slug, process.cwd()))}`);
+  }
+}
+
 async function projectsMenu(vault: Vault, tenant: string): Promise<void> {
   for (;;) {
     const ps = vault.listProjects(tenant, true) as unknown as Array<{
@@ -752,14 +789,7 @@ async function projectsMenu(vault: Vault, tenant: string): Promise<void> {
     ]);
     if (a === BACK) return;
     if (a === "__new") {
-      await act(async () => {
-        const slug = await slugPrompt("Project slug (e.g. api-service)");
-        vault.ensureProject(tenant, slug);
-        ok(`project ${tenant}/${slug} created`);
-        if (await confirm({ message: `Link the current directory (${tilde(process.cwd())}) to it?`, default: false })) {
-          ok(`linked ${tilde(vault.bindPath(tenant, slug, process.cwd()))}`);
-        }
-      });
+      await act(() => newProject(vault, tenant));
       continue;
     }
     if (a === "__archive") {
