@@ -7,7 +7,7 @@ import { checkHosts, lockRejected, prepareUse, remapPlaceholders } from "./enfor
 import { httpRequest, materializeFile, PLACEHOLDER, runWithSecrets, writeEnvFile } from "./inject.js";
 import { extractHosts } from "./policy.js";
 import { passwordFromEnv } from "./password.js";
-import { requestCredential, sealedFetch, sealedSave } from "./sealed.js";
+import { askAllow, requestCredential, sealedFetch, sealedSave } from "./sealed.js";
 import { formatRef, formatScope, formatServicePath, parseRef, parseScope, parseServicePath, type ProjectCtx, type Ref, Vault, VaultError } from "./store.js";
 
 let vault: Vault | null = null;
@@ -43,7 +43,7 @@ const server = new McpServer(
       "Prefer run_with_secrets / write_env_file / materialize_file / http_request: they use secrets without showing them.",
       "Only call reveal_secret when the user explicitly needs to see a value.",
       "When the user wants to save or fetch a secret without exposing it to Claude, use sealed_save / sealed_fetch (macOS dialog / clipboard).",
-      "Enforced by the server (you cannot bypass these): a missing ref makes the server ask the user for it in a dialog before running your tool (just use the ref you need, e.g. staging-admin-panel/systemadmin#password); secrets are only sent to each service's allowed hosts; repeated use of a password asks the user to Allow/Block; an HTTP 401 locks the credential; set_secret/set_credential are refused unless enabled per project.",
+      "Enforced by the server (you cannot bypass these): a missing ref makes the server ask the user for it in a dialog before running your tool (just use the ref you need, e.g. staging-admin-panel/systemadmin#password); secrets are only sent to each service's allowed hosts; repeated use of a password asks the user to Allow/Block; an HTTP 401 locks the credential; set_secret/set_credential (values from the chat) need the user's Allow in a dialog unless enabled per project.",
       "If a result says LOCKED or blocked: stop, do not retry and do not try another environment's credential — tell the user.",
       "Never ask the user to paste secrets into chat.",
     ].join(" "),
@@ -58,15 +58,30 @@ function applyTags(r: Ref, role?: string, isDefault?: boolean): void {
   if (role !== undefined || isDefault !== undefined) v().tagItem({ ...r, field: undefined }, { role, isDefault });
 }
 
-/** set_secret / set_credential carry values through the chat: refused unless the user enabled it per project. */
-function requireChatValues(r: Ref): void {
-  if (!v().chatValuesAllowed(r.tenant, r.project)) {
+/**
+ * set_secret / set_credential carry values through the chat. Allowed without asking only when the
+ * user enabled it for the project; otherwise the user approves each save in a native dialog
+ * (which shows the path and field names, never the values).
+ */
+async function requireChatValues(r: Ref, fieldNames: string[]): Promise<void> {
+  if (v().chatValuesAllowed(r.tenant, r.project)) return;
+  const target = formatRef({ ...r, field: undefined, version: undefined });
+  const exists = v().itemStatus(r) !== "missing";
+  const ok = await askAllow({
+    title: "cvault - save a value from the chat?",
+    message:
+      `Claude wants to save ${fieldNames.length > 1 ? `a credential (${fieldNames.join(", ")})` : "a secret"} it received in the chat:\n\n` +
+      `${target}${exists ? "\n(exists - a new version will be saved)" : ""}\n\n` +
+      `The value is already in the conversation transcript. Allow saving it to the vault?`,
+    allow: "Allow",
+    deny: "Deny",
+  });
+  if (!ok) {
     throw new VaultError(
-      `refused: storing values passed through the chat is disabled for ${r.tenant}/${r.project}. ` +
-        `Use request_credential or sealed_save (the user types the value in a dialog), or generate_secret. ` +
-        `The user can allow it with: cvault project chat-values ${r.tenant}/${r.project} on`,
+      `the user denied saving ${target} from the chat. Offer request_credential instead (the user types the value in a secure dialog).`,
     );
   }
+  v().audit("user", target, "chat-value-approved");
 }
 
 function tagNote(role?: string, isDefault?: boolean): string {
@@ -216,11 +231,11 @@ tool(
 
 tool(
   "set_secret",
-  "Store a single-value secret (API key, token). NOTE: the value passes through the chat; prefer `cvault set` CLI or generate_secret.",
+  "Store a single-value secret (API key, token) that the user gave in the chat. Unless enabled for the project, the user approves it in an Allow/Deny dialog. Prefer request_credential when the value isn't already in the chat.",
   { ref: z.string(), value: z.string(), description: z.string().optional(), role: roleArg, default: defaultArg, cwd: cwdArg },
-  ({ ref, value, description, role, default: isDefault, cwd }) => {
+  async ({ ref, value, description, role, default: isDefault, cwd }) => {
     const r = parseRef(ref, ctxFor(cwd));
-    requireChatValues(r);
+    await requireChatValues(r, ["value"]);
     const ver = v().setSecret(r, value, description);
     applyTags(r, role, isDefault);
     return `stored ${formatRef(r)} (v${ver})${tagNote(role, isDefault)}`;
@@ -229,7 +244,7 @@ tool(
 
 tool(
   "set_credential",
-  "Store a multi-field credential (e.g. {username, password, host, port}). NOTE: values pass through the chat; prefer the CLI.",
+  "Store a multi-field credential (e.g. {username, password, host, port}) that the user gave in the chat. Unless enabled for the project, the user approves it in an Allow/Deny dialog. Prefer request_credential when the values aren't already in the chat.",
   {
     ref: z.string(),
     fields: z.record(z.string(), z.string()),
@@ -238,9 +253,9 @@ tool(
     default: defaultArg,
     cwd: cwdArg,
   },
-  ({ ref, fields, description, role, default: isDefault, cwd }) => {
+  async ({ ref, fields, description, role, default: isDefault, cwd }) => {
     const r = parseRef(ref, ctxFor(cwd));
-    requireChatValues(r);
+    await requireChatValues(r, Object.keys(fields));
     const ver = v().setCredential(r, fields, description);
     applyTags(r, role, isDefault);
     return `stored ${formatRef(r)} (v${ver}) with fields [${Object.keys(fields).join(", ")}]${tagNote(role, isDefault)}`;

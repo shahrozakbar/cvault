@@ -86,18 +86,33 @@ display dialog theMsg with title "cvault" buttons {"OK"} default button "OK" wit
 `;
 
 const APPROVE_SCRIPT = `${ENV_TEXT_HANDLER}
+set theTitle to envText("CVAULT_TITLE")
 set theMsg to envText("CVAULT_MSG")
+set allowLabel to envText("CVAULT_ALLOW")
+set denyLabel to envText("CVAULT_DENY")
 set secs to (system attribute "CVAULT_SECS") as integer
 tell me to activate
-set r to display dialog theMsg with title "cvault - allow again?" buttons {"Block", "Allow"} default button "Block" cancel button "Block" with icon caution giving up after secs
+set r to display dialog theMsg with title theTitle buttons {denyLabel, allowLabel} default button denyLabel cancel button denyLabel with icon caution giving up after secs
 if gave up of r then return "GAVE_UP"
 return button returned of r
 `;
 
+/** Generic Allow/Deny dialog. Deny, Cancel and timeout all mean "no". */
+export async function askAllow(opts: { title: string; message: string; allow?: string; deny?: string; timeoutSec?: number }): Promise<boolean> {
+  const allow = opts.allow ?? "Allow";
+  const r = await osascript(APPROVE_SCRIPT, {
+    CVAULT_TITLE: opts.title,
+    CVAULT_MSG: opts.message,
+    CVAULT_ALLOW: allow,
+    CVAULT_DENY: opts.deny ?? "Deny",
+    CVAULT_SECS: String(opts.timeoutSec ?? 120),
+  });
+  return r.code === 0 && r.stdout === allow;
+}
+
 /** Ask the user to allow another use of a secret. Block, Cancel and timeout all mean "no". */
-export async function approveUse(message: string, timeoutSec = 120): Promise<boolean> {
-  const r = await osascript(APPROVE_SCRIPT, { CVAULT_MSG: message, CVAULT_SECS: String(timeoutSec) });
-  return r.code === 0 && r.stdout === "Allow";
+export function approveUse(message: string, timeoutSec = 120): Promise<boolean> {
+  return askAllow({ title: "cvault - allow again?", message, allow: "Allow", deny: "Block", timeoutSec });
 }
 
 /** Informational dialog (e.g. "entries did not match"). */

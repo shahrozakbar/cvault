@@ -216,7 +216,7 @@ The server enforces these itself, so Claude can't skip them:
 | **Allowed hosts per service** | `cvault service t/p/s --allow-host core-staging.example.com --add-host "*.staging.example.com"`. `http_request` checks the final URL; `run_with_secrets` checks the URLs, `-h/--host` flags and `user@host` in the command. Anything else is **blocked**, so a develop password can't reach staging. Only you can set this (CLI or explorer, not an MCP tool). |
 | **Lock after a rejected login** | An HTTP **401** from `http_request` locks every credential used in that request. Locked items are refused for Claude until you re-enter them (a new version unlocks) or run `cvault unlock <ref>`. You can still view and copy them in the CLI and explorer. |
 | **Use budget** | After **5** uses of a password/token field within **10 minutes** (any tool, including clipboard fills), a dialog asks **Allow / Block**. Allow gives 30 more minutes; Block locks the credential. Usernames don't count. |
-| **No values through chat** | `set_secret` / `set_credential` are refused unless you run `cvault project chat-values t/p on`. |
+| **Values from the chat need your OK** | `set_secret` / `set_credential` (values you typed in the chat) open an **Allow / Deny** dialog showing the path and field names, never the values. `cvault project chat-values t/p on` skips the dialog for a project. |
 
 ### Roles & defaults
 Give credentials a `role` (admin, viewer, tester, …) and mark one per service as the **default**. "Log in as viewer" picks the viewer item; with no role named, Claude uses the default and only asks when neither applies.
