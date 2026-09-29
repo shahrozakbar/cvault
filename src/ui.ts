@@ -719,11 +719,11 @@ async function envServicesMenu(vault: Vault, tenant: string, env: string): Promi
 /** Create a service in a given environment ("" = none), asking which project it belongs to. */
 async function createServiceIn(vault: Vault, tenant: string, env: string): Promise<string> {
   const projects = (vault.listProjects(tenant) as unknown as Array<{ project: string }>).map((p) => p.project);
-  let project = projects.length === 1 ? projects[0] : "";
-  if (!project) {
-    project = await menu<string>("Which project?", [
+  let project = "";
+  {
+    project = await menu<string>(`Which project in ${tenant}?`, [
       ...projects.map((p) => ({ name: p, value: p })),
-      { name: "+ New project…", value: "__new" },
+      { name: dim("+ New project…"), value: "__new" },
     ]);
     if (project === "__new") {
       project = await slugPrompt("Project slug (e.g. api-service)");
@@ -737,13 +737,12 @@ async function createServiceIn(vault: Vault, tenant: string, env: string): Promi
   return formatServicePath(tenant, project, key);
 }
 
-/** Ask which (active) tenant to use; skips the question when there is only one. */
+/** Ask which existing (active) tenant to use — always asked, so the choice is visible; a new one is the last option. */
 async function pickTenant(vault: Vault): Promise<string> {
   const tenants = (vault.listTenants() as Array<{ tenant: string }>).map((t) => t.tenant);
-  if (tenants.length === 1) return tenants[0];
   const t = await menu<string>("Which tenant?", [
     ...tenants.map((x) => ({ name: x, value: x })),
-    { name: "+ New tenant…", value: "__new" },
+    { name: dim("+ New tenant…"), value: "__new" },
   ]);
   if (t !== "__new") return t;
   const slug = await slugPrompt("Tenant slug (e.g. acme)");
@@ -751,11 +750,36 @@ async function pickTenant(vault: Vault): Promise<string> {
   return slug;
 }
 
-/** Create a project in `tenant`, optionally linking the current directory. */
+/** Ask which environment (existing, new, or none) — the level between tenant and project. */
+async function pickEnvironment(vault: Vault, tenant: string): Promise<string> {
+  const envs = vault.listEnvironments(tenant);
+  const e = await menu<string>(`Which environment in ${tenant}?`, [
+    ...envs.map((x) => ({ name: x, value: x })),
+    { name: dim("(no environment)"), value: NO_ENV },
+    { name: dim("+ New environment…"), value: "__new" },
+  ]);
+  if (e === "__new") return slugPrompt("Environment name (e.g. develop, staging, prod)");
+  return e === NO_ENV ? "" : e;
+}
+
+/**
+ * Create a project following the path order tenant → environment → project. In an environment the
+ * project also gets its first service (a project appears in an environment through its services).
+ * Optionally links the current directory.
+ */
 async function newProject(vault: Vault, tenant: string): Promise<void> {
-  const slug = await slugPrompt("Project slug (e.g. api-service)");
+  const env = await pickEnvironment(vault, tenant);
+  const slug = await slugPrompt(`Project slug${env ? ` in ${env}` : ""} (e.g. api-service)`);
   vault.ensureProject(tenant, slug);
-  ok(`project ${tenant}/${slug} created`);
+  if (env) {
+    const service = await slugPrompt(`First service of ${slug} in ${env} (e.g. admin-panel, postgres)`);
+    const url = await input({ message: "URL (optional)" });
+    const key = serviceKey(env, service);
+    vault.ensureService(tenant, slug, key, url ? { url } : {});
+    ok(`project ${slug} created with service ${formatServicePath(tenant, slug, key)}`);
+  } else {
+    ok(`project ${tenant}/${slug} created (no environment)`);
+  }
   if (await confirm({ message: `Link the current directory (${tilde(process.cwd())}) to it?`, default: false })) {
     ok(`linked ${tilde(vault.bindPath(tenant, slug, process.cwd()))}`);
   }
