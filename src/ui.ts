@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { collectItems, encryptBundle, type ExportFormat, toEnv, toJson, writeExport } from "./export.js";
 import { copyToClipboard } from "./sealed.js";
-import { alignedCells, auditTable, type Cell, humanSize, itemsTable, renderTable, reserveColumns } from "./table.js";
+import { alignedCells, auditTable, type Cell, humanSize, itemsTable, renderTable, reserveColumns, wrapText } from "./table.js";
 import { type GridCell, type GridConfig, type GridLine, gridSelect } from "./grid.js";
 import { type ItemType, type Ref, type Scope, Vault, VaultError, formatRef, formatScope, formatServicePath, parseRef, serviceKey, splitServiceKey } from "./store.js";
 
@@ -125,8 +125,8 @@ function drawPage(vault: Vault, crumbs: string[], info: string | undefined, with
   );
   console.log(fit(`${MARGIN}${crumbs.map((c, i) => (i === crumbs.length - 1 ? bold(cyan(c)) : c)).join(dim(" › "))}`, w));
   if (info) console.log(fit(`${MARGIN}${dim(info)}`, w));
-  const hints = " Esc back · q quit · space s search ";
-  console.log(dim("─".repeat(Math.max(2, w - hints.length - 2)) + hints + "──"));
+  // a thin divider at the page margin; the key hints live under each menu
+  console.log(MARGIN + dim("─".repeat(Math.max(10, w - MARGIN.length))));
   if (withFlash && flash.length) {
     console.log(indentBlock(flash.join("\n")));
     console.log();
@@ -261,8 +261,35 @@ function tableSection<T extends string | number>(
   maxCols: Record<number, number> = {},
   empty = "(nothing here yet)",
   dropOrder: string[] = [],
+  /** column indices whose long text wraps onto extra lines (width = maxCols[i], default 40) */
+  wrap: number[] = [],
 ): Choice<T>[] {
   if (!rows.length) return [new Separator(dim(` ${empty}`))];
+  if (wrap.length) {
+    rows = rows.map((r) => {
+      const lines: Cell[][] = [r.cells, ...(r.more ?? [])].map((l) => [...l]);
+      const values: (T | undefined)[][] | undefined = r.cellValues ? [r.cellValues, ...(r.moreValues ?? [])] : undefined;
+      for (const i of wrap) {
+        const text = r.cells[i];
+        if (text === null || text === undefined || text === "") continue;
+        const parts = wrapText(String(text), maxCols[i] || 40);
+        parts.forEach((part, k) => {
+          while (lines.length <= k) {
+            lines.push(r.cells.map(() => " "));
+            values?.push(r.cells.map(() => undefined));
+          }
+          lines[k][i] = part;
+        });
+      }
+      const [cells, ...more] = lines;
+      const out = { ...r, cells, ...(more.length ? { more } : {}) };
+      if (values) {
+        const [cellValues, ...moreValues] = values;
+        return { ...out, cellValues, ...(moreValues.length ? { moreValues } : {}) };
+      }
+      return out;
+    });
+  }
   // hide columns that are empty in every row (e.g. URL "-" everywhere, ENV on a project without environments)
   const blank = (c: Cell) => c === null || c === undefined || c === "" || c === " ";
   const allLines = rows.flatMap((r) => [r.cells, ...(r.more ?? [])]);
@@ -469,9 +496,10 @@ async function searchAll(vault: Vault): Promise<void> {
               cells: [i.ref, i.type, i.role, i.default ? yellow("yes") : "", fieldsOrFile(i), `v${i.version}`, i.description],
               value: i.ref,
             })),
-            { 0: 0, 4: 0, 6: 30 },
+            { 0: 0, 4: 0, 6: 34 },
             "no matches",
-            ["DESCRIPTION", "VER", "DEFAULT", "ROLE", "TYPE"],
+            ["VER", "DEFAULT", "TYPE", "DESCRIPTION", "ROLE"],
+            [6],
           ),
           { name: dim("← back"), value: BACK },
         ]);
@@ -798,9 +826,10 @@ async function projectMenu(vault: Vault, tenant: string, project: string): Promi
             value: i.ref,
           };
         }),
-        { 2: 0, 6: 0, 8: 30 },
+        { 2: 0, 6: 0, 8: 34 },
         "no items yet — add one below",
-        ["DESCRIPTION", "VER", "DEFAULT", "ROLE", "TYPE"],
+        ["VER", "DEFAULT", "TYPE", "DESCRIPTION", "ROLE"],
+        [8],
       ),
       section("Actions"),
       { name: "+ New item…", value: "__new" },
@@ -897,9 +926,10 @@ async function serviceMenu(vault: Vault, tenant: string, project: string, servic
           ],
           value: i.ref,
         })),
-        { 0: 0, 4: 0, 6: 30 },
+        { 0: 0, 4: 0, 6: 34 },
         undefined,
-        ["DESCRIPTION", "VER", "DEFAULT", "ROLE"],
+        ["VER", "DEFAULT", "DESCRIPTION", "ROLE"],
+        [6],
       ),
       section("Actions"),
       { name: "+ New credential…", value: "__cred" },
@@ -1089,7 +1119,7 @@ function detailsTable(info: ItemInfo, hosts: string[]): string {
         : [["allowed hosts", dim("any (no restriction)")] as Cell[]]),
       ...(info.locked ? [[red("LOCKED"), `${info.locked.at} UTC - ${info.locked.reason}`] as Cell[]] : []),
     ],
-    { maxCol: 0 },
+    { maxCol: 0, maxCols: { 1: 72 }, wrap: ["VALUE"] },
   );
 }
 

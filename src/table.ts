@@ -23,6 +23,35 @@ function truncate(s: string, max: number): string {
   return [...plain].slice(0, Math.max(1, max - 1)).join("") + "…";
 }
 
+/**
+ * Word-wrap `text` to lines of at most `width` columns (breaks at spaces; words longer than the
+ * width are split). Colour codes are dropped from wrapped text.
+ */
+export function wrapText(text: string, width: number): string[] {
+  const clean = text.replace(ANSI, "").replace(/\s+/g, " ").trim();
+  if (width < 4 || [...clean].length <= width) return [clean];
+  const lines: string[] = [];
+  let line = "";
+  for (let word of clean.split(" ")) {
+    while ([...word].length > width) {
+      if (line) {
+        lines.push(line);
+        line = "";
+      }
+      lines.push([...word].slice(0, width).join(""));
+      word = [...word].slice(width).join("");
+    }
+    if (!line) line = word;
+    else if ([...line].length + 1 + [...word].length <= width) line += ` ${word}`;
+    else {
+      lines.push(line);
+      line = word;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 interface TableOpts {
   title?: string;
   /** default max width per column (0 = unlimited) */
@@ -40,6 +69,8 @@ interface TableOpts {
    * { drop: "HEADER" } hides a column; { shrink: "HEADER", min: n } shortens it down to n chars.
    */
   steps?: Array<{ drop: string } | { shrink: string; min?: number }>;
+  /** column headers whose long text wraps onto extra lines instead of being cut with … */
+  wrap?: string[];
 }
 
 const MIN_COL = 8;
@@ -90,7 +121,13 @@ export function renderTable(headers: string[], rows: Cell[][], opts: TableOpts =
   }
 
   const widths = keep.map((i) => w.get(i)!);
-  const body = raw.map((r) => keep.map((i, j) => truncate(r[i], widths[j])));
+  const wraps = keep.map((i) => (opts.wrap ?? []).includes(headers[i]));
+  // each row may span several lines when a wrapped column needs them
+  const body = raw.flatMap((r) => {
+    const cellLines = keep.map((i, j) => (wraps[j] && r[i] !== dim("-") ? wrapText(r[i], widths[j]) : [truncate(r[i], widths[j])]));
+    const height = Math.max(...cellLines.map((l) => l.length));
+    return Array.from({ length: height }, (_, k) => cellLines.map((l) => l[k] ?? ""));
+  });
   const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - width(s)));
   const line = (l: string, m: string, r: string) => l + widths.map((n) => "─".repeat(n + 2)).join(m) + r;
   const row = (cells: string[]) => "│" + cells.map((c, j) => ` ${pad(c, widths[j])} `).join("│") + "│";
@@ -191,17 +228,20 @@ export function itemsTable(items: ItemRowLike[], title = "Items"): string {
     {
       title: `${title} (${items.length})`,
       maxCol: 50,
-      maxCols: { 0: 0, 4: 0, 7: 45 },
+      maxCols: { 0: 0, 4: 0, 7: 40 },
+      wrap: ["DESCRIPTION", "FIELDS / FILE"],
       steps: [
         { drop: "UPDATED" },
-        { shrink: "DESCRIPTION", min: 20 },
-        { shrink: "FIELDS / FILE", min: 24 },
+        { shrink: "DESCRIPTION", min: 24 },
+        { shrink: "FIELDS / FILE", min: 20 },
         { drop: "VER" },
         { drop: "DEFAULT" },
-        { drop: "DESCRIPTION" },
         { drop: "TYPE" },
-        { shrink: "FIELDS / FILE", min: 14 },
         { drop: "ROLE" },
+        { shrink: "DESCRIPTION", min: 16 },
+        { shrink: "FIELDS / FILE", min: 12 },
+        { drop: "FIELDS / FILE" },
+        { drop: "DESCRIPTION" },
         { shrink: "REF", min: 30 },
       ],
     },
