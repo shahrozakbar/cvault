@@ -41,6 +41,27 @@ const cyan = (s: string) => `\x1b[36m${s}\x1b[39m`;
 const inverse = (s: string) => `\x1b[7m${s}\x1b[27m`;
 const SEP = dim(" │ ");
 
+/** Visible width (ANSI-aware). */
+const vwidth = (s: string) => [...plain(s)].length;
+/** Cut a rendered line to `max` visible columns, keeping colours intact up to the cut. */
+function fitLine(line: string, max: number): string {
+  if (vwidth(line) <= max) return line;
+  let out = "";
+  let n = 0;
+  for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith("\x1b[")) {
+      out += part;
+      continue;
+    }
+    for (const ch of part) {
+      if (n >= max - 1) return out + "…\x1b[0m";
+      out += ch;
+      n++;
+    }
+  }
+  return out;
+}
+
 interface Pos {
   li: number;
   ci: number;
@@ -131,7 +152,9 @@ export const gridSelect = createPrompt(<T>(config: GridConfig<T>, done: (value: 
   });
 
   const multi = (l: GridLine<T>) => l.kind === "row" && l.cells.length > 1;
-  const render = (l: GridLine<T>, li: number): string => {
+  const maxWidth = Math.max(20, (process.stdout.columns || 120) - 1);
+  const render = (l: GridLine<T>, li: number): string => fitLine(renderRaw(l, li), maxWidth);
+  const renderRaw = (l: GridLine<T>, li: number): string => {
     if (l.kind === "sep") return ` ${l.text}`;
     const active = li === pos.li;
     const text = l.cells
@@ -152,11 +175,10 @@ export const gridSelect = createPrompt(<T>(config: GridConfig<T>, done: (value: 
 
   const hasColumns = lines.some((l) => selectable(l).length > 1);
   const keys = [
-    hasColumns ? "↑↓ rows · ←→ columns (← first = back, → last = open)" : "↑↓ move · ⏎/→ open · ←/Esc back",
-    ...(hasColumns ? ["⏎ open · Esc back"] : []),
+    hasColumns ? "↑↓ rows · ←→ columns · ⏎/→ open · ←/Esc back" : "↑↓ move · ⏎/→ open · ←/Esc back",
     ...(config.search !== undefined ? [leader ? cyan("space-s: press s to search") : "space s search"] : []),
     ...(config.quit !== undefined ? ["q quit"] : []),
   ];
-  const help = dim(keys.join(" · "));
+  const help = fitLine(`  ${dim(keys.join(" · "))}`, maxWidth);
   return `${cyan("?")} ${bold(config.message)}\n${shown.join("\n")}\n${help}`;
 });

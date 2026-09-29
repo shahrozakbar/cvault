@@ -44,9 +44,18 @@ interface TableOpts {
 
 const MIN_COL = 8;
 
-/** Terminal width on a TTY; unlimited when piped so files/scripts get the full table. */
+/** Columns reserved around tables (the interactive UI indents them); set by the UI. */
+let reservedColumns = 1;
+export function reserveColumns(n: number): void {
+  reservedColumns = n;
+}
+
+/**
+ * Usable width on a TTY (never the full width: writing into the last column makes many terminals
+ * wrap); unlimited when piped so files/scripts get the full table.
+ */
 export function terminalWidth(): number {
-  return process.stdout.isTTY && process.stdout.columns ? process.stdout.columns : Number.POSITIVE_INFINITY;
+  return process.stdout.isTTY && process.stdout.columns ? process.stdout.columns - reservedColumns : Number.POSITIVE_INFINITY;
 }
 
 export function renderTable(headers: string[], rows: Cell[][], opts: TableOpts = {}): string {

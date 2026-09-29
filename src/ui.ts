@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { collectItems, encryptBundle, type ExportFormat, toEnv, toJson, writeExport } from "./export.js";
 import { copyToClipboard } from "./sealed.js";
-import { alignedCells, auditTable, type Cell, humanSize, itemsTable, renderTable } from "./table.js";
+import { alignedCells, auditTable, type Cell, humanSize, itemsTable, renderTable, reserveColumns } from "./table.js";
 import { type GridCell, type GridConfig, type GridLine, gridSelect } from "./grid.js";
 import { type ItemType, type Ref, type Scope, Vault, VaultError, formatRef, formatScope, formatServicePath, parseRef, serviceKey, splitServiceKey } from "./store.js";
 
@@ -76,7 +76,11 @@ const fail = (msg: string) => flash.push(red(`✖ ${msg}`));
 const note = (text: string) => flash.push(text);
 
 const tilde = (p: string) => (p.startsWith(homedir()) ? "~" + p.slice(homedir().length) : p);
-const termWidth = () => Math.min(process.stdout.columns || 100, 160);
+/** Usable width: one column short of the terminal (writing into the last column makes terminals wrap). */
+const termWidth = () => Math.min((process.stdout.columns || 100) - 1, 160);
+/** Everything below the page header starts at this margin, aligned with menu text ("❯ " = 2 columns). */
+const MARGIN = "  ";
+const indentBlock = (text: string) => text.split("\n").map((l) => (l ? MARGIN + l : l)).join("\n");
 
 function stats(vault: Vault): { projects: number; items: number } {
   const projects = vault.listProjects() as unknown as Array<{ tenant: string; project: string }>;
@@ -98,11 +102,12 @@ let redraw: (() => void) | null = null;
 
 /** Print a block that belongs to the current page (and is redrawn with it). */
 function pagePrint(text: string): void {
-  console.log(text);
+  const block = indentBlock(text);
+  console.log(block);
   const prev = redraw;
   redraw = () => {
     prev?.();
-    console.log(text);
+    console.log(block);
   };
 }
 
@@ -118,12 +123,12 @@ function drawPage(vault: Vault, crumbs: string[], info: string | undefined, with
   console.log(
     fit(`${inverse(bold(" cvault "))} ${dim(`${s.items} item${s.items === 1 ? "" : "s"} in ${s.projects} project${s.projects === 1 ? "" : "s"} · ${tilde(vault.home)}`)}`, w),
   );
-  console.log(fit(` ${crumbs.map((c, i) => (i === crumbs.length - 1 ? bold(cyan(c)) : c)).join(dim(" › "))}`, w));
-  if (info) console.log(fit(` ${dim(info)}`, w));
+  console.log(fit(`${MARGIN}${crumbs.map((c, i) => (i === crumbs.length - 1 ? bold(cyan(c)) : c)).join(dim(" › "))}`, w));
+  if (info) console.log(fit(`${MARGIN}${dim(info)}`, w));
   const hints = " Esc back · q quit · space s search ";
   console.log(dim("─".repeat(Math.max(2, w - hints.length - 2)) + hints + "──"));
   if (withFlash && flash.length) {
-    console.log(flash.join("\n"));
+    console.log(indentBlock(flash.join("\n")));
     console.log();
     flash = [];
   }
@@ -135,7 +140,7 @@ const backChoice = { name: dim("← back"), value: BACK };
 const SECTION_WIDTH = 34;
 /** Non-selectable section heading inside a menu (all the same width). */
 const section = (title: string) =>
-  new Separator(cyan(`── ${title} ${"─".repeat(Math.max(2, SECTION_WIDTH - title.length - 4))}`));
+  new Separator(` ${cyan(`── ${title} ${"─".repeat(Math.max(2, SECTION_WIDTH - title.length - 4))}`)}`);
 
 /** A row whose cells are individually selectable (value per cell; undefined = not selectable). */
 type GridChoice<T> = { grid: GridCell<T>[] };
@@ -149,12 +154,34 @@ class QuitRequested extends Error {
 }
 let uiVault: Vault | null = null;
 
-/** Grid rows → plain choices, for the stock search prompt (whole row = one choice). */
+/** Cut a rendered line to `max` visible columns (ANSI-aware). */
+function fitAnsi(line: string, max: number): string {
+  const plainLen = [...line.replace(/\x1b\[[0-9;]*m/g, "")].length;
+  if (plainLen <= max) return line;
+  let out = "";
+  let n = 0;
+  for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith("\x1b[")) {
+      out += part;
+      continue;
+    }
+    for (const ch of part) {
+      if (n >= max - 1) return `${out}…\x1b[0m`;
+      out += ch;
+      n++;
+    }
+  }
+  return out;
+}
+
+/** Grid rows → plain choices, for the stock search prompt (whole row = one choice), fitted to the terminal. */
 function toPlainChoices<T>(choices: Choice<T>[]): Array<{ name: string; value: T } | Separator> {
+  const max = termWidth() - 2; // the search prompt prefixes each row with "❯ "
   return choices.map((c) => {
-    if (Separator.isSeparator(c) || !("grid" in c)) return c as { name: string; value: T } | Separator;
+    if (Separator.isSeparator(c)) return new Separator(fitAnsi((c as Separator).separator, max + 1));
+    if (!("grid" in c)) return { ...c, name: fitAnsi(c.name, max) };
     const value = c.grid.find((cell) => cell.value !== undefined)?.value as T;
-    return { name: c.grid.map((cell) => cell.text).join(dim(" │ ")), value };
+    return { name: fitAnsi(c.grid.map((cell) => cell.text).join(dim(" │ ")), max), value };
   });
 }
 
@@ -290,7 +317,9 @@ function spread<T>(
 ): { cells: Cell[]; more?: Cell[][]; cellValues?: (T | undefined)[]; moreValues?: (T | undefined)[][] } {
   const n = Math.max(1, ...Object.values(lists).map((l) => l.length));
   const blank = " ";
-  const lineAt = (k: number) => first.map((c, i) => (i in lists ? (lists[i][k] ?? blank) : k === 0 ? c : blank));
+  // an empty list shows "-" on the row itself (like any empty cell); continuation lines stay blank
+  const lineAt = (k: number) =>
+    first.map((c, i) => (i in lists ? (lists[i][k] ?? (k === 0 && !lists[i].length ? "" : blank)) : k === 0 ? c : blank));
   const valuesAt = (k: number) =>
     first.map((_, i) => {
       if (i in lists) return lists[i][k] !== undefined && valueOf ? valueOf(i, lists[i][k]) : undefined;
@@ -372,6 +401,7 @@ async function copy(vault: Vault, ref: Ref, label: string): Promise<void> {
 
 export async function runUi(vault: Vault): Promise<void> {
   uiVault = vault;
+  reserveColumns(MARGIN.length + 1);
   try {
     await mainMenu(vault);
   } catch (e) {
@@ -426,6 +456,7 @@ async function searchAll(vault: Vault): Promise<void> {
     picked = await search<string>(
     {
       message: "Search  (type to filter · Esc to go back)",
+      theme: { style: { keysHelpTip: () => `${MARGIN}${dim("↑↓ move · ⏎ open · Esc back")}` } },
       pageSize: PAGE_SIZE,
       source: (term) => {
         const t = (term ?? "").toLowerCase();
@@ -605,14 +636,18 @@ async function envServicesMenu(vault: Vault, tenant: string, env: string): Promi
       ...tableSection(
         ["SERVICE", "PROJECT", "URL", "ITEMS", "ALLOWED HOSTS", "STATUS"],
         svcs.map((sv) => ({
-          cells: [
-            sv.service,
-            sv.project,
-            sv.url,
-            sv.items + ((sv as SvcRow & { archived_items?: number }).archived_items ? dim(` (+${(sv as SvcRow & { archived_items?: number }).archived_items} archived)`) : ""),
-            vault.allowedHosts(tenant, sv.project, sv.key).join(", "),
-            status(sv.archived_at),
-          ],
+          // one allowed host per line
+          ...spread(
+            [
+              sv.service,
+              sv.project,
+              sv.url,
+              sv.items + ((sv as SvcRow & { archived_items?: number }).archived_items ? dim(` (+${(sv as SvcRow & { archived_items?: number }).archived_items} archived)`) : ""),
+              "",
+              status(sv.archived_at),
+            ],
+            { 4: vault.allowedHosts(tenant, sv.project, sv.key) },
+          ),
           value: `${sv.project}\u0000${sv.key}`,
         })),
         { 2: 50, 4: 60 },
@@ -810,7 +845,10 @@ async function servicesMenu(vault: Vault, tenant: string, project: string): Prom
       ...tableSection(
         ["ENV", "SERVICE", "URL", "ITEMS", "ALLOWED HOSTS", "STATUS"],
         svcs.map((s) => ({
-          cells: [s.environment ? cyan(s.environment) : "", s.service, s.url, s.items, vault.allowedHosts(tenant, project, s.key).join(", "), status(s.archived_at)],
+          ...spread(
+            [s.environment ? cyan(s.environment) : "", s.service, s.url, s.items, "", status(s.archived_at)],
+            { 4: vault.allowedHosts(tenant, project, s.key) },
+          ),
           value: s.key,
         })),
         { 2: 50, 4: 60 },
@@ -1046,7 +1084,9 @@ function detailsTable(info: ItemInfo, hosts: string[]): string {
       ["role", info.role ? `${info.role}${info.default ? " (default)" : ""}` : info.default ? "(default)" : ""],
       ["version", `v${info.version} · updated ${info.updated_at} UTC`],
       ["description", info.description],
-      ["allowed hosts", hosts.length ? hosts.join(", ") : dim("any (no restriction)")],
+      ...(hosts.length
+        ? hosts.map((h, i) => [i === 0 ? "allowed hosts" : " ", h] as Cell[])
+        : [["allowed hosts", dim("any (no restriction)")] as Cell[]]),
       ...(info.locked ? [[red("LOCKED"), `${info.locked.at} UTC - ${info.locked.reason}`] as Cell[]] : []),
     ],
     { maxCol: 0 },
